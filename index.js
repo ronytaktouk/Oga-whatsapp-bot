@@ -42,7 +42,10 @@ const SYSTEM_PROMPT = `You are OGA, a WhatsApp business assistant for Nigerian t
 5. **Payments Made**: "I paid [person] [amount]" → type: "payment_out"
 
 ## When You Detect a Transaction
-ALWAYS respond with the message first, then add this JSON block (no markdown):
+1. Respond naturally to the user (just confirm you recorded it)
+2. Keep it simple and friendly
+3. DO NOT show any JSON or technical format to the user
+4. After your message, add a blank line and include this JSON (for backend processing only):
 
 [TRANSACTION]
 {
@@ -64,13 +67,13 @@ Just respond naturally without the JSON block.
 - Keep responses brief (max 2-3 sentences)
 - Be honest about what you can and can't do
 - Always confirm amounts before saving
+- IMPORTANT: The JSON [TRANSACTION] block is for backend only - users should never see it
 
 ## Example Conversations
 User: "I sold tomato 5000 to Mama Bola"
-You: "Got it! You sold tomato for ₦5,000 to Mama Bola. Is she paying now or later?"
-[TRANSACTION]
-{"type": "sale", "amount": 5000, "paid": 0, "balance": 5000, "party": "Mama Bola", "item": "tomato"}
-[/TRANSACTION]
+You: "Got it! Recorded a sale of tomato for ₦5,000 to Mama Bola. Is she paying now or later?"
+
+(Then internally add the JSON block - user won't see it)
 
 User: "How much did I make today?"
 You: "You've made ₦12,500 in sales today and spent ₦2,000 on transport. Your net is ₦10,500."
@@ -257,20 +260,24 @@ async function handleMessage(from, trader, message) {
 
   // Parse transaction if present
   const transactionMatch = fullText.match(
-    /\[TRANSACTION\]([\s\S]*?)\[\/TRANSACTION\]/
+    /\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/
   );
   let transaction = null;
   let responseText = fullText;
 
   if (transactionMatch) {
     try {
-      transaction = JSON.parse(transactionMatch[1]);
-      responseText = fullText.replace(
-        /\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/,
-        ''
-      ).trim();
+      transaction = JSON.parse(transactionMatch[1].trim());
+      // Remove the [TRANSACTION] block from user response
+      responseText = fullText
+        .replace(/\n?\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
+        .trim();
     } catch (e) {
       console.error('Transaction parse error:', e);
+      // If JSON parsing fails, still remove the transaction block from response
+      responseText = fullText
+        .replace(/\n?\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
+        .trim();
     }
   }
 
