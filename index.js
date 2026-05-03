@@ -74,8 +74,7 @@ async function createTrader(phone) {
       subscription_tier: 'trial',
       trial_start: new Date(),
       trial_end: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000), // 14 days
-      is_active: true,
-      language_pref: 'pidgin'
+      is_active: true
     })
     .select()
     .single();
@@ -225,8 +224,34 @@ async function sendMessage(to, message) {
 // ============================================
 
 async function handleOnboarding(from, trader, message) {
-  if (!trader.name) {
-    // Collect name
+  if (!trader.language_pref) {
+    // STEP 1: Collect language preference
+    const choice = message.trim().toLowerCase();
+    let languagePref = null;
+
+    if (choice === '1' || choice === 'english') {
+      languagePref = 'english';
+    } else if (choice === '2' || choice === 'pidgin') {
+      languagePref = 'pidgin';
+    } else {
+      await sendMessage(
+        from,
+        'Please reply: 1 for English or 2 for Pidgin'
+      );
+      return;
+    }
+
+    await supabase
+      .from('traders')
+      .update({ language_pref: languagePref })
+      .eq('id', trader.id);
+
+    await sendMessage(
+      from,
+      'Thank you! 🙏\nWhat is your name?'
+    );
+  } else if (!trader.name) {
+    // STEP 2: Collect name
     await supabase
       .from('traders')
       .update({ name: message.trim() })
@@ -237,7 +262,7 @@ async function handleOnboarding(from, trader, message) {
       `Good to meet you ${message.trim()}! 🙏\nChoose a 4-digit PIN to protect your account — you will need it if you ever change your number.`
     );
   } else if (!trader.pin) {
-    // Collect PIN
+    // STEP 3: Collect PIN
     if (message.length !== 4 || !/^\d+$/.test(message)) {
       await sendMessage(from, 'Please enter a valid 4-digit PIN');
       return;
@@ -294,12 +319,31 @@ async function handleMessage(from, trader, message) {
     const fullText = response.content[0].text;
     console.log(`✅ Claude responded (${fullText.length} chars)`);
 
+    // Parse language switch if present
+    const languageSwitchMatch = fullText.match(
+      /\[LANGUAGE_SWITCH\](english|pidgin)\[\/LANGUAGE_SWITCH\]/i
+    );
+    let responseText = fullText;
+
+    if (languageSwitchMatch) {
+      const newLanguage = languageSwitchMatch[1].toLowerCase();
+      await supabase
+        .from('traders')
+        .update({ language_pref: newLanguage })
+        .eq('id', trader.id);
+      console.log(`🌐 Language switched to: ${newLanguage}`);
+
+      // Remove the [LANGUAGE_SWITCH] block from user response
+      responseText = fullText
+        .replace(/\[LANGUAGE_SWITCH\](english|pidgin)\[\/LANGUAGE_SWITCH\]/gi, '')
+        .trim();
+    }
+
     // Parse transaction if present
-    const transactionMatch = fullText.match(
+    const transactionMatch = responseText.match(
       /\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/
     );
     let transaction = null;
-    let responseText = fullText;
 
     if (transactionMatch) {
       try {
@@ -312,13 +356,13 @@ async function handleMessage(from, trader, message) {
         }
 
         // Remove the [TRANSACTION] block from user response
-        responseText = fullText
+        responseText = responseText
           .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
           .trim();
       } catch (e) {
         console.error('⚠️ Transaction parse error:', e.message);
         // Still remove the block even if parsing failed
-        responseText = fullText
+        responseText = responseText
           .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
           .trim();
       }
@@ -384,13 +428,13 @@ app.post('/webhook', async (req, res) => {
 
       await sendMessage(
         from,
-        `👋 Welcome to OGA!\nI manage your business money right here on WhatsApp.\nNo app needed.\nWhat is your name?`
+        `👋 Welcome to OGA!\nWhich language do you prefer?\nReply: 1 for English or 2 for Pidgin`
       );
       return res.status(200).send('OK');
     }
 
     // Check if onboarding incomplete
-    if (!trader.name || !trader.pin) {
+    if (!trader.language_pref || !trader.name || !trader.pin) {
       await handleOnboarding(from, trader, message);
       return res.status(200).send('OK');
     }
