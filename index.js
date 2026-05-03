@@ -148,26 +148,53 @@ async function saveConversationHistory(traderId, role, content) {
 }
 
 /**
- * Load trader context for Claude
+ * Load trader context for Claude - Fresh data every message
  */
 async function loadTraderContext(traderId) {
   const today = new Date().toISOString().split('T')[0];
 
-  // Get recent transactions
-  const { data: transactions } = await supabase
-    .from('transactions')
-    .select('*')
-    .eq('trader_id', traderId)
-    .order('created_at', { ascending: false })
-    .limit(50);
-
-  // Get conversation history
+  // CONVERSATION MEMORY: Last 30 messages for conversational context
   const { data: history } = await supabase
     .from('conversation_history')
     .select('*')
     .eq('trader_id', traderId)
     .order('created_at', { ascending: false })
-    .limit(10);
+    .limit(30);
+
+  // FINANCIAL MEMORY: All transactions (for accurate balances and summaries)
+  const { data: transactions } = await supabase
+    .from('transactions')
+    .select('*')
+    .eq('trader_id', traderId)
+    .order('created_at', { ascending: false })
+    .limit(100);
+
+  // Get trader subscription status
+  const { data: trader } = await supabase
+    .from('traders')
+    .select('subscription_tier, trial_end')
+    .eq('id', traderId)
+    .single();
+
+  // Calculate party balances (who owes how much)
+  const partyBalances = {};
+  transactions?.forEach((t) => {
+    if (t.party_name && (t.type === 'sale' || t.type === 'payment_in')) {
+      if (!partyBalances[t.party_name]) {
+        partyBalances[t.party_name] = { owed: 0, paid: 0 };
+      }
+      partyBalances[t.party_name].owed += t.total_amount || 0;
+      partyBalances[t.party_name].paid += t.amount_paid || 0;
+    }
+  });
+
+  // Calculate outstanding balances
+  const outstandingBalances = Object.entries(partyBalances)
+    .map(([party, data]) => ({
+      party,
+      outstanding: (data.owed - data.paid) || 0
+    }))
+    .filter(b => b.outstanding > 0);
 
   // Calculate today's summary
   const todaySales = transactions
@@ -186,11 +213,54 @@ async function loadTraderContext(traderId) {
     )
     .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
 
+  const todayCollected = transactions
+    ?.filter(
+      (t) =>
+        (t.type === 'payment_in' || t.type === 'sale') &&
+        t.transaction_date && t.transaction_date.startsWith(today)
+    )
+    .reduce((sum, t) => sum + (t.amount_paid || 0), 0) || 0;
+
+  const totalOutstanding = outstandingBalances.reduce((sum, b) => sum + b.outstanding, 0) || 0;
+
   return {
+    conversationHistory: history || [],
+    recentTransactions: transactions?.slice(0, 5) || [],
+    partyBalances: outstandingBalances,
     todaySales,
     todayExpenses,
-    recentTransactions: transactions?.slice(0, 10) || [],
-    conversationHistory: history || []
+    todayCollected,
+    totalOutstanding,
+    subscriptionStatus: trader?.subscription_tier || 'trial',
+    trialEndsAt: trader?.trial_end || null
+  };
+}
+
+/**
+ * Check daily message limit (40 messages per day, Lagos timezone UTC+1)
+ */
+async function checkDailyMessageLimit(traderId) {
+  // Calculate today's start in Lagos timezone (UTC+1)
+  const now = new Date();
+  const lagosTime = new Date(now.getTime() + (1 * 60 * 60 * 1000)); // Add 1 hour for Lagos offset
+  const todayStart = new Date(lagosTime.getFullYear(), lagosTime.getMonth(), lagosTime.getDate());
+  const todayStartUTC = new Date(todayStart.getTime() - (1 * 60 * 60 * 1000)); // Convert back to UTC
+
+  // Count user messages sent today (role = 'user' only)
+  const { data: todayMessages } = await supabase
+    .from('conversation_history')
+    .select('id')
+    .eq('trader_id', traderId)
+    .eq('role', 'user')
+    .gte('created_at', todayStartUTC.toISOString());
+
+  const messageCount = todayMessages?.length || 0;
+
+  return {
+    count: messageCount,
+    remaining: Math.max(0, 40 - messageCount),
+    hasReachedLimit: messageCount >= 40,
+    isWarning: messageCount >= 38 && messageCount < 40
   };
 }
 
@@ -287,6 +357,18 @@ async function handleOnboarding(from, trader, message) {
 
 async function handleMessage(from, trader, message) {
   try {
+    // CHECK DAILY MESSAGE LIMIT (40 messages per day, Lagos time)
+    const limitStatus = await checkDailyMessageLimit(trader.id);
+
+    if (limitStatus.hasReachedLimit) {
+      // User has hit the 40 message daily limit
+      await sendMessage(
+        from,
+        `You have reached today's limit of 40 messages ${trader.name}.\nI reset at midnight tonight Lagos time.\nYour records are all safe — nothing is lost.\nSee you tomorrow! 🌙`
+      );
+      return;
+    }
+
     // Load trader context
     const context = await loadTraderContext(trader.id);
 
@@ -310,7 +392,7 @@ async function handleMessage(from, trader, message) {
     // Call Claude API with system prompt
     console.log(`🤖 Calling Claude for ${trader.name}...`);
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 500,
       system: SYSTEM_PROMPT,
       messages: messages,
@@ -383,6 +465,11 @@ async function handleMessage(from, trader, message) {
       .from('traders')
       .update({ last_active: new Date() })
       .eq('id', trader.id);
+
+    // ADD WARNING IF APPROACHING DAILY LIMIT (38-39 messages)
+    if (limitStatus.isWarning) {
+      responseText += `\n\n(${limitStatus.remaining} messages remaining today 🙏)`;
+    }
 
     // Send response to user
     await sendMessage(from, responseText);
