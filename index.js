@@ -1,15 +1,38 @@
+// OGA WhatsApp Business Assistant - Main Bot Logic
+// Handles all message processing, transaction detection, and AI responses
+
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
-const cron = require('node-cron');
 const bcrypt = require('bcrypt');
 require('dotenv').config();
 
+// Import helper functions
+const {
+  parseNumberFormat,
+  parseDateFormat,
+  detectBusinessType,
+  categorizeExpense,
+  formatNaira,
+  extractAmounts
+} = require('./helpers');
+
+// Import system prompt
+const SYSTEM_PROMPT = require('./system-prompt');
+
+// Import cron jobs
+const { initializeCrons } = require('./crons');
+
+// ============================================
+// INITIALIZE EXPRESS APP
+// ============================================
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// Initialize clients
+// ============================================
+// INITIALIZE CLIENTS
+// ============================================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
@@ -24,63 +47,13 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// System prompt for Claude
-const SYSTEM_PROMPT = `You are OGA, a WhatsApp business assistant for Nigerian traders. Your role is to help them track sales, purchases, expenses, and payments.
+// ============================================
+// DATABASE FUNCTIONS
+// ============================================
 
-## Your Personality
-- Professional but warm
-- Fluent in English, Pidgin English, and Nigerian slang
-- Never give financial or investment advice
-- Be encouraging and supportive
-- Use emojis sparingly
-
-## Transaction Types You Understand
-1. **Sales**: "I sell [item] [amount] to [person]" → type: "sale"
-2. **Purchases**: "I buy [item] [amount] from [person]" → type: "purchase"
-3. **Expenses**: "I spend [amount] on [description]" → type: "expense"
-4. **Payments Received**: "[Person] paid me [amount]" → type: "payment_in"
-5. **Payments Made**: "I paid [person] [amount]" → type: "payment_out"
-
-## When You Detect a Transaction
-1. Respond naturally to the user (just confirm you recorded it)
-2. Keep it simple and friendly
-3. DO NOT show any JSON or technical format to the user
-4. After your message, add a blank line and include this JSON (for backend processing only):
-
-[TRANSACTION]
-{
-  "type": "sale|purchase|expense|payment_in|payment_out",
-  "amount": 15000,
-  "paid": 10000,
-  "balance": 5000,
-  "party": "Name of person",
-  "item": "What was sold/bought/spent on"
-}
-[/TRANSACTION]
-
-## When You DON'T Detect a Transaction
-Just respond naturally without the JSON block.
-
-## Rules
-- Ask clarifying questions if you're unsure
-- Never store bank details or passwords
-- Keep responses brief (max 2-3 sentences)
-- Be honest about what you can and can't do
-- Always confirm amounts before saving
-- IMPORTANT: The JSON [TRANSACTION] block is for backend only - users should never see it
-
-## Example Conversations
-User: "I sold tomato 5000 to Mama Bola"
-You: "Got it! Recorded a sale of tomato for ₦5,000 to Mama Bola. Is she paying now or later?"
-
-(Then internally add the JSON block - user won't see it)
-
-User: "How much did I make today?"
-You: "You've made ₦12,500 in sales today and spent ₦2,000 on transport. Your net is ₦10,500."
-
-You are here to help traders manage their business money better.`;
-
-// Database functions
+/**
+ * Get trader by WhatsApp number
+ */
 async function getTrader(phone) {
   const { data, error } = await supabase
     .from('traders')
@@ -90,20 +63,34 @@ async function getTrader(phone) {
   return data;
 }
 
+/**
+ * Create new trader
+ */
 async function createTrader(phone) {
   const { data, error } = await supabase
     .from('traders')
     .insert({
       whatsapp_number: phone,
       subscription_tier: 'trial',
-      trial_end: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      trial_start: new Date(),
+      trial_end: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000), // 14 days
       is_active: true,
+      language_pref: 'pidgin'
     })
     .select()
     .single();
+
+  if (error) {
+    console.error('❌ Error creating trader:', error);
+    return null;
+  }
+
   return data;
 }
 
+/**
+ * Save transaction to database
+ */
 async function saveTransaction(traderId, txData) {
   const { data, error } = await supabase
     .from('transactions')
@@ -111,19 +98,29 @@ async function saveTransaction(traderId, txData) {
       trader_id: traderId,
       type: txData.type,
       total_amount: txData.amount,
-      amount_paid: txData.paid,
-      balance_remaining: txData.balance,
+      amount_paid: txData.paid || 0,
+      balance_remaining: txData.balance || 0,
       party_name: txData.party,
       item_description: txData.item,
+      category: txData.category || 'other',
+      business_type: txData.business_type || 'general',
       notes: txData.notes || '',
+      transaction_date: txData.transaction_date || new Date()
     })
     .select()
     .single();
 
-  if (error) console.error('Transaction save error:', error);
+  if (error) {
+    console.error('❌ Transaction save error:', error);
+    return null;
+  }
+
   return data;
 }
 
+/**
+ * Save conversation history
+ */
 async function saveConversationHistory(traderId, role, content) {
   const { data, error } = await supabase
     .from('conversation_history')
@@ -151,9 +148,13 @@ async function saveConversationHistory(traderId, role, content) {
   return data;
 }
 
+/**
+ * Load trader context for Claude
+ */
 async function loadTraderContext(traderId) {
   const today = new Date().toISOString().split('T')[0];
 
+  // Get recent transactions
   const { data: transactions } = await supabase
     .from('transactions')
     .select('*')
@@ -161,140 +162,209 @@ async function loadTraderContext(traderId) {
     .order('created_at', { ascending: false })
     .limit(50);
 
+  // Get conversation history
+  const { data: history } = await supabase
+    .from('conversation_history')
+    .select('*')
+    .eq('trader_id', traderId)
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  // Calculate today's summary
   const todaySales = transactions
     ?.filter(
       (t) =>
         t.type === 'sale' &&
-        t.created_at.startsWith(today)
+        t.transaction_date.startsWith(today)
     )
-    .reduce((sum, t) => sum + t.total_amount, 0) || 0;
+    .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
 
   const todayExpenses = transactions
     ?.filter(
       (t) =>
         t.type === 'expense' &&
-        t.created_at.startsWith(today)
+        t.transaction_date.startsWith(today)
     )
-    .reduce((sum, t) => sum + t.total_amount, 0) || 0;
+    .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
 
   return {
     todaySales,
     todayExpenses,
     recentTransactions: transactions?.slice(0, 10) || [],
+    conversationHistory: history || []
   };
 }
 
+/**
+ * Send WhatsApp message via Twilio
+ */
 async function sendMessage(to, message) {
-  const chunks = message.match(/[\s\S]{1,1600}/g) || [message];
-  for (const chunk of chunks) {
-    await twilioClient.messages.create({
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: to,
-      body: chunk,
+  try {
+    const chunks = message.match(/[\s\S]{1,1600}/g) || [message];
+    for (const chunk of chunks) {
+      await twilioClient.messages.create({
+        from: process.env.TWILIO_WHATSAPP_NUMBER,
+        to: to,
+        body: chunk,
+      });
+    }
+    console.log(`📤 Message sent to ${to}`);
+  } catch (error) {
+    console.error('❌ Error sending message:', error);
+    // Queue the message for retry
+    await supabase.from('message_queue').insert({
+      whatsapp_number: to,
+      message_content: message,
+      received_at: new Date()
     });
   }
 }
 
+// ============================================
+// ONBOARDING FLOW
+// ============================================
+
 async function handleOnboarding(from, trader, message) {
   if (!trader.name) {
+    // Collect name
     await supabase
       .from('traders')
       .update({ name: message.trim() })
       .eq('id', trader.id);
+
     await sendMessage(
       from,
-      `Nice to meet you, ${message.trim()}! 👋\n\nNow create a 4-digit PIN to secure your account:`
+      `Good to meet you ${message.trim()}! 🙏\nChoose a 4-digit PIN to protect your account — you will need it if you ever change your number.`
     );
   } else if (!trader.pin) {
+    // Collect PIN
     if (message.length !== 4 || !/^\d+$/.test(message)) {
       await sendMessage(from, 'Please enter a valid 4-digit PIN');
       return;
     }
+
     const hashedPin = await bcrypt.hash(message, 10);
     await supabase
       .from('traders')
       .update({ pin: hashedPin })
       .eq('id', trader.id);
+
     await sendMessage(
       from,
-      `✅ PIN set! You're all set, ${trader.name}.\n\nNow you can start recording transactions. Try:\n"I sell tomato 5000 to Mama Bola"`
+      `✅ You are all set ${trader.name}!\nJust talk to me normally — tell me what happens in your business and I handle the rest.\nWhat happened today? 🚀`
     );
   }
 }
 
+// ============================================
+// MESSAGE HANDLER - MAIN LOGIC
+// ============================================
+
 async function handleMessage(from, trader, message) {
-  // Load conversation history
-  const { data: history } = await supabase
-    .from('conversation_history')
-    .select('*')
-    .eq('trader_id', trader.id)
-    .order('created_at', { ascending: false })
-    .limit(10);
+  try {
+    // Load trader context
+    const context = await loadTraderContext(trader.id);
 
-  const context = await loadTraderContext(trader.id);
-
-  // Build messages for Claude
-  const messages = [];
-  if (history && history.length > 0) {
-    history.reverse().forEach((msg) => {
-      messages.push({
-        role: msg.role,
-        content: msg.content,
+    // Build conversation history for Claude
+    const messages = [];
+    if (context.conversationHistory && context.conversationHistory.length > 0) {
+      context.conversationHistory.reverse().forEach((msg) => {
+        messages.push({
+          role: msg.role,
+          content: msg.content,
+        });
       });
+    }
+
+    // Add current message
+    messages.push({
+      role: 'user',
+      content: message,
+    });
+
+    // Call Claude API with system prompt
+    console.log(`🤖 Calling Claude for ${trader.name}...`);
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 500,
+      system: SYSTEM_PROMPT,
+      messages: messages,
+    });
+
+    const fullText = response.content[0].text;
+    console.log(`✅ Claude responded (${fullText.length} chars)`);
+
+    // Parse transaction if present
+    const transactionMatch = fullText.match(
+      /\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/
+    );
+    let transaction = null;
+    let responseText = fullText;
+
+    if (transactionMatch) {
+      try {
+        transaction = JSON.parse(transactionMatch[1].trim());
+        console.log(`✅ Transaction detected: ${transaction.type}`);
+
+        // Auto-detect business type if not provided
+        if (!transaction.business_type) {
+          transaction.business_type = detectBusinessType(message);
+        }
+
+        // Remove the [TRANSACTION] block from user response
+        responseText = fullText
+          .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
+          .trim();
+      } catch (e) {
+        console.error('⚠️ Transaction parse error:', e.message);
+        // Still remove the block even if parsing failed
+        responseText = fullText
+          .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
+          .trim();
+      }
+    }
+
+    // Save transaction if detected
+    if (transaction) {
+      await saveTransaction(trader.id, transaction);
+      console.log(`💾 Saved transaction: ${transaction.type}`);
+    }
+
+    // Save conversation history
+    await saveConversationHistory(trader.id, 'user', message);
+    await saveConversationHistory(trader.id, 'assistant', responseText);
+
+    // Update trader's last_active timestamp
+    await supabase
+      .from('traders')
+      .update({ last_active: new Date() })
+      .eq('id', trader.id);
+
+    // Send response to user
+    await sendMessage(from, responseText);
+
+  } catch (error) {
+    console.error('❌ Error handling message:', error);
+
+    // Send error message to user
+    await sendMessage(
+      from,
+      'OGA is resting briefly 😴\nYour message is safe and waiting.\nBack in under 5 minutes. Sorry for the wait 🙏'
+    );
+
+    // Queue the message for retry
+    await supabase.from('message_queue').insert({
+      whatsapp_number: from,
+      message_content: message,
+      received_at: new Date()
     });
   }
-  messages.push({
-    role: 'user',
-    content: message,
-  });
-
-  // Call Claude
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 500,
-    system: SYSTEM_PROMPT,
-    messages: messages,
-  });
-
-  const fullText = response.content[0].text;
-
-  // Parse transaction if present
-  const transactionMatch = fullText.match(
-    /\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/
-  );
-  let transaction = null;
-  let responseText = fullText;
-
-  if (transactionMatch) {
-    try {
-      transaction = JSON.parse(transactionMatch[1].trim());
-      // Remove the [TRANSACTION] block from user response
-      responseText = fullText
-        .replace(/\n?\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
-        .trim();
-    } catch (e) {
-      console.error('Transaction parse error:', e);
-      // If JSON parsing fails, still remove the transaction block from response
-      responseText = fullText
-        .replace(/\n?\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
-        .trim();
-    }
-  }
-
-  // Save transaction if detected
-  if (transaction) {
-    await saveTransaction(trader.id, transaction);
-  }
-
-  // Save conversation
-  await saveConversationHistory(trader.id, 'user', message);
-  await saveConversationHistory(trader.id, 'assistant', responseText);
-
-  // Send response
-  await sendMessage(from, responseText);
 }
 
-// Webhook endpoint
+// ============================================
+// WEBHOOK ENDPOINT
+// ============================================
+
 app.post('/webhook', async (req, res) => {
   try {
     const from = req.body.From;
@@ -304,13 +374,17 @@ app.post('/webhook', async (req, res) => {
       return res.status(400).send('Missing From or Body');
     }
 
+    console.log(`📨 Message from ${from}: ${message.substring(0, 50)}...`);
+
     // Get or create trader
     let trader = await getTrader(from);
     if (!trader) {
       trader = await createTrader(from);
+      console.log(`✨ New trader created: ${from}`);
+
       await sendMessage(
         from,
-        `👋 Welcome to OGA!\n\nI manage your business money right here on WhatsApp. No app needed.\n\nWhat is your name?`
+        `👋 Welcome to OGA!\nI manage your business money right here on WhatsApp.\nNo app needed.\nWhat is your name?`
       );
       return res.status(200).send('OK');
     }
@@ -326,29 +400,32 @@ app.post('/webhook', async (req, res) => {
 
     res.status(200).send('OK');
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error('❌ Webhook error:', error);
     res.status(500).send('Error');
   }
 });
 
-// Health check
+// ============================================
+// HEALTH CHECK ENDPOINT
+// ============================================
+
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+  res.status(200).json({ status: 'ok', timestamp: new Date() });
 });
 
-// Cron jobs
-cron.schedule('*/15 * * * *', async () => {
-  console.log('Running reminder check...');
-});
+// ============================================
+// START SERVER
+// ============================================
 
-cron.schedule('0 8 1 * *', async () => {
-  console.log('Running monthly report generation...');
-});
-
-// Start server
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`🤖 OGA Bot running on port ${PORT}`);
-  console.log(`💬 Webhook: http://localhost:${PORT}/webhook`);
-  console.log(`❤️ Health: http://localhost:${PORT}/health`);
+  console.log('\n' + '='.repeat(50));
+  console.log('🤖 OGA Bot running on port ' + PORT);
+  console.log('💬 Webhook: http://localhost:' + PORT + '/webhook');
+  console.log('❤️  Health: http://localhost:' + PORT + '/health');
+  console.log('='.repeat(50) + '\n');
+
+  // Initialize cron jobs
+  initializeCrons(supabase, twilioClient, anthropic);
 });
