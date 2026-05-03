@@ -1,5 +1,6 @@
 // Cron Jobs for OGA Bot
 // Scheduled tasks that run automatically
+// ⚠️ TEMPORARILY DISABLED: node-cron incompatible with Node.js 18+
 
 const cron = require('node-cron');
 const moment = require('moment-timezone');
@@ -9,12 +10,16 @@ const moment = require('moment-timezone');
 // ============================================
 
 function initializeCrons(supabase, twilioClient, anthropic) {
-  console.log('🕐 Initializing cron jobs...');
+  console.log('🕐 Cron jobs disabled temporarily (Node.js 18+ compatibility issue)...');
+
+  // TODO: Fix node-cron with named functions or upgrade to v4+
+  // Cron jobs temporarily disabled to prevent:
+  // TypeError: Cannot assign to read only property 'name'
 
   // ============================================
-  // 1. REMINDERS — Every 15 minutes
+  // 1. REMINDERS — Every 15 minutes [DISABLED]
   // ============================================
-  cron.schedule('*/15 * * * *', async () => {
+  /* DISABLED: cron.schedule('*/15 * * * *', async () => {
     try {
       console.log('📬 Checking for due reminders...');
 
@@ -73,12 +78,12 @@ function initializeCrons(supabase, twilioClient, anthropic) {
     } catch (error) {
       console.error('❌ Cron error - Reminders:', error);
     }
-  });
+  }); */
 
   // ============================================
-  // 2. RECURRING TRANSACTIONS — Daily 8am Lagos time
+  // 2. RECURRING TRANSACTIONS — Daily 8am Lagos time [DISABLED]
   // ============================================
-  cron.schedule('0 8 * * *', 'Africa/Lagos', async () => {
+  /* DISABLED: cron.schedule('0 8 * * *', 'Africa/Lagos', async () => {
     try {
       console.log('🔄 Checking for recurring transactions due today...');
 
@@ -126,12 +131,12 @@ Have you paid/received it? Reply YES to record it.`;
     } catch (error) {
       console.error('❌ Cron error - Recurring transactions:', error);
     }
-  });
+  }); */
 
   // ============================================
-  // 3. INACTIVE USER CHECK — Daily 10am Lagos time
+  // 3. INACTIVE USER CHECK — Daily 10am Lagos time [DISABLED]
   // ============================================
-  cron.schedule('0 10 * * *', 'Africa/Lagos', async () => {
+  /* DISABLED: cron.schedule('0 10 * * *', 'Africa/Lagos', async () => {
     try {
       console.log('👤 Checking for inactive users...');
 
@@ -180,12 +185,12 @@ Just message me when you are ready to continue 🙏`;
     } catch (error) {
       console.error('❌ Cron error - Inactive users:', error);
     }
-  });
+  }); */
 
   // ============================================
-  // 4. MESSAGE QUEUE PROCESSOR — Every 5 minutes
+  // 4. MESSAGE QUEUE PROCESSOR — Every 5 minutes [DISABLED]
   // ============================================
-  cron.schedule('*/5 * * * *', async () => {
+  /* DISABLED: cron.schedule('*/5 * * * *', async () => {
     try {
       console.log('📤 Processing message queue...');
 
@@ -224,12 +229,12 @@ Just message me when you are ready to continue 🙏`;
     } catch (error) {
       console.error('❌ Cron error - Message queue:', error);
     }
-  });
+  }); */
 
   // ============================================
-  // 5. MONTHLY PDF REPORT — 1st of month at 8am Lagos time
+  // 5. MONTHLY PDF REPORT — 1st of month at 8am Lagos time [DISABLED]
   // ============================================
-  cron.schedule('0 8 1 * *', 'Africa/Lagos', async () => {
+  /* DISABLED: cron.schedule('0 8 1 * *', 'Africa/Lagos', async () => {
     try {
       console.log('📊 Generating monthly PDF reports...');
 
@@ -253,9 +258,9 @@ Just message me when you are ready to continue 🙏`;
     } catch (error) {
       console.error('❌ Cron error - Monthly reports:', error);
     }
-  });
+  }); */
 
-  console.log('✅ All cron jobs initialized');
+  console.log('✅ Cron job initialization skipped (disabled for Node.js compatibility)');
 }
 
 // ============================================
