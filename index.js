@@ -6,6 +6,7 @@ const { createClient } = require('@supabase/supabase-js');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
 const bcrypt = require('bcrypt');
+const ws = require('ws');
 require('dotenv').config();
 
 // Import helper functions
@@ -35,7 +36,12 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_ANON_KEY,
+  {
+    realtime: {
+      transport: ws
+    }
+  }
 );
 
 const anthropic = new Anthropic({
