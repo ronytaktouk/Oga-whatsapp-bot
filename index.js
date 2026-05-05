@@ -169,6 +169,22 @@ async function loadTraderContext(traderId) {
     .order('created_at', { ascending: false })
     .limit(100);
 
+  // PRODUCTS: All products or top 20 by times_sold
+  const { data: allProducts } = await supabase
+    .from('products')
+    .select('*')
+    .eq('trader_id', traderId)
+    .order('times_sold', { ascending: false })
+    .limit(20);
+
+  // PARTIES: All parties with outstanding balances + top by transaction count
+  const { data: allParties } = await supabase
+    .from('parties')
+    .select('*')
+    .eq('trader_id', traderId)
+    .order('transaction_count', { ascending: false })
+    .limit(15);
+
   // Get trader subscription status
   const { data: trader } = await supabase
     .from('traders')
@@ -227,6 +243,8 @@ async function loadTraderContext(traderId) {
     conversationHistory: history || [],
     recentTransactions: transactions?.slice(0, 5) || [],
     partyBalances: outstandingBalances,
+    products: allProducts || [],
+    parties: allParties || [],
     todaySales,
     todayExpenses,
     todayCollected,
@@ -262,6 +280,128 @@ async function checkDailyMessageLimit(traderId) {
     hasReachedLimit: messageCount >= 40,
     isWarning: messageCount >= 38 && messageCount < 40
   };
+}
+
+/**
+ * Save or update product price
+ */
+async function saveProduct(traderId, productName, sellPrice, buyPrice = null) {
+  const { data, error } = await supabase
+    .from('products')
+    .upsert({
+      trader_id: traderId,
+      product_name: productName,
+      sell_price: sellPrice,
+      buy_price: buyPrice || 0,
+      updated_at: new Date()
+    }, { onConflict: 'trader_id,product_name' })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('❌ Error saving product:', error);
+    return null;
+  }
+
+  return data;
+}
+
+/**
+ * Update product after sale
+ */
+async function updateProductAfterSale(traderId, productName, soldPrice) {
+  const { data: existing } = await supabase
+    .from('products')
+    .select('times_sold')
+    .eq('trader_id', traderId)
+    .eq('product_name', productName)
+    .single();
+
+  const { data, error } = await supabase
+    .from('products')
+    .update({
+      times_sold: (existing?.times_sold || 0) + 1,
+      last_sold_price: soldPrice,
+      last_sold_at: new Date(),
+      sell_price: soldPrice,
+      updated_at: new Date()
+    })
+    .eq('trader_id', traderId)
+    .eq('product_name', productName)
+    .select()
+    .single();
+
+  if (error) {
+    console.error('❌ Error updating product:', error);
+    return null;
+  }
+
+  return data;
+}
+
+/**
+ * Get product price
+ */
+async function getProduct(traderId, productName) {
+  const { data } = await supabase
+    .from('products')
+    .select('*')
+    .eq('trader_id', traderId)
+    .eq('product_name', productName)
+    .single();
+
+  return data || null;
+}
+
+/**
+ * Save or update party (client/supplier)
+ */
+async function saveParty(traderId, partyName, balanceChange = 0, lastTransaction = null) {
+  // Get existing balance if party exists
+  const { data: existing } = await supabase
+    .from('parties')
+    .select('balance, transaction_count')
+    .eq('trader_id', traderId)
+    .eq('party_name', partyName)
+    .single();
+
+  const newBalance = (existing?.balance || 0) + balanceChange;
+  const newCount = (existing?.transaction_count || 0) + 1;
+
+  const { data, error } = await supabase
+    .from('parties')
+    .upsert({
+      trader_id: traderId,
+      party_name: partyName,
+      balance: newBalance,
+      transaction_count: newCount,
+      last_seen: new Date(),
+      last_transaction: lastTransaction || null,
+      updated_at: new Date()
+    }, { onConflict: 'trader_id,party_name' })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('❌ Error saving party:', error);
+    return null;
+  }
+
+  return data;
+}
+
+/**
+ * Get party info
+ */
+async function getParty(traderId, partyName) {
+  const { data } = await supabase
+    .from('parties')
+    .select('*')
+    .eq('trader_id', traderId)
+    .eq('party_name', partyName)
+    .single();
+
+  return data || null;
 }
 
 /**
@@ -389,12 +529,34 @@ async function handleMessage(from, trader, message) {
       content: message,
     });
 
-    // Call Claude API with system prompt
+    // BUILD EXTENDED SYSTEM PROMPT WITH TRADER CONTEXT
+    let extendedSystemPrompt = SYSTEM_PROMPT;
+
+    // Add products context
+    if (context.products && context.products.length > 0) {
+      const productsList = context.products
+        .map(p => `${p.product_name} (₦${p.sell_price}, sold ${p.times_sold}x)`)
+        .join(' | ');
+      extendedSystemPrompt += `\n\nYOUR PRODUCTS: ${productsList}`;
+    }
+
+    // Add parties context
+    if (context.parties && context.parties.length > 0) {
+      const partiesList = context.parties
+        .filter(p => p.balance !== 0)
+        .map(p => `${p.party_name} ${p.balance > 0 ? '(owes ₦' + p.balance + ')' : '(you owe ₦' + Math.abs(p.balance) + ')'}`)
+        .join(' | ');
+      if (partiesList) {
+        extendedSystemPrompt += `\n\nYOUR CLIENTS: ${partiesList}`;
+      }
+    }
+
+    // Call Claude API with extended system prompt
     console.log(`🤖 Calling Claude for ${trader.name}...`);
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 500,
-      system: SYSTEM_PROMPT,
+      system: extendedSystemPrompt,
       messages: messages,
     });
 
@@ -437,6 +599,17 @@ async function handleMessage(from, trader, message) {
           transaction.business_type = detectBusinessType(message);
         }
 
+        // PRICE LOGIC: Check if transaction involves a known product
+        if (transaction && transaction.item) {
+          const existingProduct = await getProduct(trader.id, transaction.item);
+
+          if (existingProduct) {
+            // Product known: use last price
+            transaction.amount = transaction.amount || existingProduct.sell_price;
+            console.log(`✅ Using known price for ${existingProduct.product_name}: ₦${existingProduct.sell_price}`);
+          }
+        }
+
         // Remove the [TRANSACTION] block from user response
         responseText = responseText
           .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
@@ -454,6 +627,40 @@ async function handleMessage(from, trader, message) {
     if (transaction) {
       await saveTransaction(trader.id, transaction);
       console.log(`💾 Saved transaction: ${transaction.type}`);
+
+      // UPDATE PRODUCT HISTORY
+      if (transaction.type === 'sale' && transaction.item) {
+        await updateProductAfterSale(trader.id, transaction.item, transaction.amount);
+        console.log(`📦 Updated product sales count: ${transaction.item}`);
+      }
+
+      if (transaction.type === 'purchase' && transaction.item) {
+        await saveProduct(trader.id, transaction.item, null, transaction.amount);
+        console.log(`📦 Saved purchase product: ${transaction.item}`);
+      }
+
+      // CLIENT LOGIC: Track party balance
+      if (transaction.party) {
+        let balanceChange = 0;
+
+        if (transaction.type === 'sale' || transaction.type === 'purchase') {
+          balanceChange = transaction.amount - (transaction.paid || 0);
+        } else if (transaction.type === 'payment_in') {
+          balanceChange = -(transaction.amount); // Reduces their debt
+        } else if (transaction.type === 'payment_out') {
+          balanceChange = transaction.amount; // Increases what trader owes
+        }
+
+        if (balanceChange !== 0) {
+          await saveParty(
+            trader.id,
+            transaction.party,
+            balanceChange,
+            `${transaction.type}: ₦${transaction.amount}`
+          );
+          console.log(`👥 Updated party balance: ${transaction.party}`);
+        }
+      }
     }
 
     // Save conversation history
