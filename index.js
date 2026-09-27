@@ -18,6 +18,159 @@ const {
   extractAmounts
 } = require('./helpers');
 
+// ============================================
+// ADDITIONAL HELPER FUNCTIONS
+// ============================================
+
+/**
+ * Detect if user is asking for a summary or comparison
+ */
+function isSummaryQuery(message) {
+  const msg = message.toLowerCase();
+  const summaryKeywords = [
+    'summary', 'total', 'how much', 'balance', 'owe',
+    'compare', 'last month', 'this month', 'last week',
+    'this week', 'this year', 'profit', 'loss', 'sales',
+    'expenses', 'breakdown', 'report', 'statement',
+    'how many', 'count', 'all transactions'
+  ];
+  return summaryKeywords.some(keyword => msg.includes(keyword));
+}
+
+/**
+ * Parse time range from message (e.g., "last month", "this week", "2 weeks ago")
+ */
+function parseTimeRange(message) {
+  const msg = message.toLowerCase();
+  const now = new Date();
+  const today = now.toISOString().split('T')[0];
+
+  let startDate, endDate;
+
+  // Last month
+  if (msg.includes('last month')) {
+    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+    startDate = lastMonth.toISOString().split('T')[0];
+    endDate = lastMonthEnd.toISOString().split('T')[0];
+  }
+  // This month
+  else if (msg.includes('this month')) {
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    startDate = monthStart.toISOString().split('T')[0];
+    endDate = today;
+  }
+  // Last week
+  else if (msg.includes('last week')) {
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    startDate = weekAgo.toISOString().split('T')[0];
+    endDate = today;
+  }
+  // This week
+  else if (msg.includes('this week')) {
+    const weekStart = new Date(now);
+    weekStart.setDate(now.getDate() - now.getDay());
+    startDate = weekStart.toISOString().split('T')[0];
+    endDate = today;
+  }
+  // X days/weeks ago
+  else {
+    const daysAgoMatch = msg.match(/(\d+)\s*days?\s*ago/);
+    const weeksAgoMatch = msg.match(/(\d+)\s*weeks?\s*ago/);
+
+    if (daysAgoMatch) {
+      const days = parseInt(daysAgoMatch[1]);
+      const dateAgo = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+      startDate = dateAgo.toISOString().split('T')[0];
+      endDate = today;
+    } else if (weeksAgoMatch) {
+      const weeks = parseInt(weeksAgoMatch[1]);
+      const dateAgo = new Date(now.getTime() - weeks * 7 * 24 * 60 * 60 * 1000);
+      startDate = dateAgo.toISOString().split('T')[0];
+      endDate = today;
+    } else {
+      // Default: last 30 days
+      const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      startDate = thirtyDaysAgo.toISOString().split('T')[0];
+      endDate = today;
+    }
+  }
+
+  return { startDate, endDate };
+}
+
+/**
+ * Get comprehensive transaction summary for a time period
+ */
+async function getTransactionSummary(traderId, startDate, endDate, supabase) {
+  try {
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('trader_id', traderId)
+      .gte('transaction_date', startDate)
+      .lte('transaction_date', endDate)
+      .order('transaction_date', { ascending: false });
+
+    if (error) {
+      console.error('❌ Error fetching transactions:', error);
+      return null;
+    }
+
+    // Calculate totals by type
+    const sales = transactions
+      ?.filter(t => t.type === 'sale')
+      .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+
+    const purchases = transactions
+      ?.filter(t => t.type === 'purchase')
+      .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+
+    const expenses = transactions
+      ?.filter(t => t.type === 'expense')
+      .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+
+    const paymentsOut = transactions
+      ?.filter(t => t.type === 'payment_out')
+      .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+
+    const paymentsIn = transactions
+      ?.filter(t => t.type === 'payment_in')
+      .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+
+    // Calculate profit
+    const profit = sales - purchases - expenses;
+
+    // Group by category
+    const byCategory = {};
+    transactions?.forEach(t => {
+      const cat = t.category || 'uncategorized';
+      if (!byCategory[cat]) byCategory[cat] = 0;
+      if (t.type === 'expense' || t.type === 'purchase') {
+        byCategory[cat] -= (t.total_amount || 0);
+      } else {
+        byCategory[cat] += (t.total_amount || 0);
+      }
+    });
+
+    return {
+      period: `${startDate} to ${endDate}`,
+      totalTransactions: transactions?.length || 0,
+      sales: formatNaira(sales),
+      purchases: formatNaira(purchases),
+      expenses: formatNaira(expenses),
+      paymentsIn: formatNaira(paymentsIn),
+      paymentsOut: formatNaira(paymentsOut),
+      profit: formatNaira(profit),
+      byCategory,
+      rawData: transactions || []
+    };
+  } catch (error) {
+    console.error('❌ Error in getTransactionSummary:', error);
+    return null;
+  }
+}
+
 // Import system prompt
 const SYSTEM_PROMPT = require('./system-prompt');
 
@@ -151,7 +304,7 @@ async function saveConversationHistory(traderId, role, content) {
 /**
  * Load trader context for Claude
  */
-async function loadTraderContext(traderId) {
+async function loadTraderContext(traderId, userMessage = '') {
   const today = new Date().toISOString().split('T')[0];
 
   // Get recent transactions
@@ -162,13 +315,13 @@ async function loadTraderContext(traderId) {
     .order('created_at', { ascending: false })
     .limit(50);
 
-  // Get conversation history
+  // Get conversation history (reduced from 10 to 5 for better token efficiency)
   const { data: history } = await supabase
     .from('conversation_history')
     .select('*')
     .eq('trader_id', traderId)
     .order('created_at', { ascending: false })
-    .limit(10);
+    .limit(5);
 
   // Calculate today's summary
   const todaySales = transactions
@@ -189,11 +342,24 @@ async function loadTraderContext(traderId) {
     )
     .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
 
+  // Check if user is asking for a summary
+  let summaryData = null;
+  if (isSummaryQuery(userMessage)) {
+    const timeRange = parseTimeRange(userMessage);
+    summaryData = await getTransactionSummary(
+      traderId,
+      timeRange.startDate,
+      timeRange.endDate,
+      supabase
+    );
+  }
+
   return {
     todaySales,
     todayExpenses,
     recentTransactions: transactions?.slice(0, 10) || [],
-    conversationHistory: history || []
+    conversationHistory: history || [],
+    summaryData
   };
 }
 
@@ -264,8 +430,8 @@ async function handleOnboarding(from, trader, message) {
 
 async function handleMessage(from, trader, message, messageTimestamp = new Date()) {
   try {
-    // Load trader context
-    const context = await loadTraderContext(trader.id);
+    // Load trader context (pass message for summary detection)
+    const context = await loadTraderContext(trader.id, message);
 
     // Format message date for Claude context
     const messageDateStr = messageTimestamp.toISOString().split('T')[0];
@@ -287,13 +453,38 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
       });
     }
 
-    // Add current message with date context
+    // Build user message with context
+    let userMessageContent = `[Sent: ${messageDateFormatted}]\n${message}`;
+
+    // If summary is requested, add summary data to Claude's context
+    if (context.summaryData) {
+      console.log(`📊 Summary query detected - attaching period data`);
+      userMessageContent += `\n\n[TRANSACTION_SUMMARY]\n`;
+      userMessageContent += `Period: ${context.summaryData.period}\n`;
+      userMessageContent += `Total Transactions: ${context.summaryData.totalTransactions}\n`;
+      userMessageContent += `Sales: ${context.summaryData.sales}\n`;
+      userMessageContent += `Purchases: ${context.summaryData.purchases}\n`;
+      userMessageContent += `Expenses: ${context.summaryData.expenses}\n`;
+      userMessageContent += `Profit: ${context.summaryData.profit}\n`;
+
+      // Add category breakdown
+      if (Object.keys(context.summaryData.byCategory).length > 0) {
+        userMessageContent += `\nBy Category:\n`;
+        for (const [cat, amount] of Object.entries(context.summaryData.byCategory)) {
+          userMessageContent += `- ${cat}: ${formatNaira(amount)}\n`;
+        }
+      }
+      userMessageContent += `[/TRANSACTION_SUMMARY]`;
+    }
+
+    // Add current message
     messages.push({
       role: 'user',
-      content: `[Sent: ${messageDateFormatted}]\n${message}`,
+      content: userMessageContent,
     });
 
     // Call Claude API with system prompt
+    // Note: Prompt caching is automatically enabled by Claude SDK when system prompt is provided
     console.log(`🤖 Calling Claude for ${trader.name}...`);
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
