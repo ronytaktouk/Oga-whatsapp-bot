@@ -356,6 +356,7 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
       .eq('id', trader.id);
 
     // Send response to user
+    console.log(`💬 Sending to ${from}: ${responseText.substring(0, 100)}...`);
     await sendMessage(from, responseText);
 
   } catch (error) {
