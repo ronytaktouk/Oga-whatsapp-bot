@@ -1,7 +1,7 @@
 // Cron Jobs for OGA Bot
 // Scheduled tasks that run automatically
 
-const cron = require('node-cron');
+const schedule = require('node-schedule');
 const moment = require('moment-timezone');
 
 // ============================================
@@ -14,7 +14,7 @@ function initializeCrons(supabase, twilioClient, anthropic) {
   // ============================================
   // 1. REMINDERS — Every 15 minutes
   // ============================================
-  cron.schedule('*/15 * * * *', async function remindersJob() {
+  schedule.scheduleJob('*/15 * * * *', async () => {
     try {
       console.log('📬 Checking for due reminders...');
 
@@ -78,11 +78,15 @@ function initializeCrons(supabase, twilioClient, anthropic) {
   // ============================================
   // 2. RECURRING TRANSACTIONS — Daily 8am Lagos time
   // ============================================
-  cron.schedule('0 8 * * *', 'Africa/Lagos', async function recurringTransactionsJob() {
+  schedule.scheduleJob('0 8 * * *', async () => {
     try {
+      // Check if current time is in Lagos timezone (convert to Lagos time)
+      const lagosTime = moment.tz('Africa/Lagos');
+      if (lagosTime.hour() !== 8 || lagosTime.minute() !== 0) return; // Only run at exact 8am Lagos
+
       console.log('🔄 Checking for recurring transactions due today...');
 
-      const today = moment.tz('Africa/Lagos').format('YYYY-MM-DD');
+      const today = lagosTime.format('YYYY-MM-DD');
       const { data: recurringTxs, error } = await supabase
         .from('recurring_transactions')
         .select('*')
@@ -103,7 +107,7 @@ function initializeCrons(supabase, twilioClient, anthropic) {
             .single();
 
           if (trader.data) {
-            const prompt = `It is ${moment.tz('Africa/Lagos').format('dddd')} ${trader.data.name}.
+            const prompt = `It is ${lagosTime.format('dddd')} ${trader.data.name}.
 Your ${tx.description} of ₦${tx.amount.toLocaleString()} is due today.
 Have you paid/received it? Reply YES to record it.`;
 
@@ -131,11 +135,14 @@ Have you paid/received it? Reply YES to record it.`;
   // ============================================
   // 3. INACTIVE USER CHECK — Daily 10am Lagos time
   // ============================================
-  cron.schedule('0 10 * * *', 'Africa/Lagos', async function inactiveUserCheckJob() {
+  schedule.scheduleJob('0 10 * * *', async () => {
     try {
+      const lagosTime = moment.tz('Africa/Lagos');
+      if (lagosTime.hour() !== 10 || lagosTime.minute() !== 0) return; // Only run at exact 10am Lagos
+
       console.log('👤 Checking for inactive users...');
 
-      const fiveDaysAgo = moment.tz('Africa/Lagos').subtract(5, 'days').toISOString();
+      const fiveDaysAgo = lagosTime.subtract(5, 'days').toISOString();
       const { data: inactiveUsers, error } = await supabase
         .from('traders')
         .select('id, whatsapp_number, name, last_active')
@@ -154,13 +161,12 @@ Have you paid/received it? Reply YES to record it.`;
             .from('reminders')
             .select('id')
             .eq('trader_id', user.id)
-            .gte('created_at', moment.tz('Africa/Lagos').subtract(1, 'day').toISOString())
+            .gte('created_at', lagosTime.subtract(1, 'day').toISOString())
             .single();
 
           if (!recentMessage.data) {
             // Only message on weekdays, not on Sunday
-            const today = moment.tz('Africa/Lagos');
-            if (today.day() !== 0) {
+            if (lagosTime.day() !== 0) {
               // Not Sunday
               const message = `${user.name} — hope everything is fine with you and the business.
 Quick update while you were away:
@@ -185,7 +191,7 @@ Just message me when you are ready to continue 🙏`;
   // ============================================
   // 4. MESSAGE QUEUE PROCESSOR — Every 5 minutes
   // ============================================
-  cron.schedule('*/5 * * * *', async function messageQueueJob() {
+  schedule.scheduleJob('*/5 * * * *', async () => {
     try {
       console.log('📤 Processing message queue...');
 
@@ -229,8 +235,11 @@ Just message me when you are ready to continue 🙏`;
   // ============================================
   // 5. MONTHLY PDF REPORT — 1st of month at 8am Lagos time
   // ============================================
-  cron.schedule('0 8 1 * *', 'Africa/Lagos', async function monthlyReportJob() {
+  schedule.scheduleJob('0 8 1 * *', async () => {
     try {
+      const lagosTime = moment.tz('Africa/Lagos');
+      if (lagosTime.hour() !== 8 || lagosTime.minute() !== 0) return; // Only run at exact 8am Lagos
+
       console.log('📊 Generating monthly PDF reports...');
 
       const { data: activeTraders, error } = await supabase
