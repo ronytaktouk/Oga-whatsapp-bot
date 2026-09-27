@@ -175,6 +175,7 @@ async function loadTraderContext(traderId) {
     ?.filter(
       (t) =>
         t.type === 'sale' &&
+        t.transaction_date &&
         t.transaction_date.startsWith(today)
     )
     .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
@@ -183,6 +184,7 @@ async function loadTraderContext(traderId) {
     ?.filter(
       (t) =>
         t.type === 'expense' &&
+        t.transaction_date &&
         t.transaction_date.startsWith(today)
     )
     .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
