@@ -14,7 +14,7 @@ function initializeCrons(supabase, twilioClient, anthropic) {
   // ============================================
   // 1. REMINDERS — Every 15 minutes
   // ============================================
-  cron.schedule('*/15 * * * *', async () => {
+  cron.schedule('*/15 * * * *', async function remindersJob() {
     try {
       console.log('📬 Checking for due reminders...');
 
@@ -78,7 +78,7 @@ function initializeCrons(supabase, twilioClient, anthropic) {
   // ============================================
   // 2. RECURRING TRANSACTIONS — Daily 8am Lagos time
   // ============================================
-  cron.schedule('0 8 * * *', 'Africa/Lagos', async () => {
+  cron.schedule('0 8 * * *', 'Africa/Lagos', async function recurringTransactionsJob() {
     try {
       console.log('🔄 Checking for recurring transactions due today...');
 
@@ -131,7 +131,7 @@ Have you paid/received it? Reply YES to record it.`;
   // ============================================
   // 3. INACTIVE USER CHECK — Daily 10am Lagos time
   // ============================================
-  cron.schedule('0 10 * * *', 'Africa/Lagos', async () => {
+  cron.schedule('0 10 * * *', 'Africa/Lagos', async function inactiveUserCheckJob() {
     try {
       console.log('👤 Checking for inactive users...');
 
@@ -185,7 +185,7 @@ Just message me when you are ready to continue 🙏`;
   // ============================================
   // 4. MESSAGE QUEUE PROCESSOR — Every 5 minutes
   // ============================================
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('*/5 * * * *', async function messageQueueJob() {
     try {
       console.log('📤 Processing message queue...');
 
@@ -229,7 +229,7 @@ Just message me when you are ready to continue 🙏`;
   // ============================================
   // 5. MONTHLY PDF REPORT — 1st of month at 8am Lagos time
   // ============================================
-  cron.schedule('0 8 1 * *', 'Africa/Lagos', async () => {
+  cron.schedule('0 8 1 * *', 'Africa/Lagos', async function monthlyReportJob() {
     try {
       console.log('📊 Generating monthly PDF reports...');
 
