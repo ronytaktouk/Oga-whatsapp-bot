@@ -603,10 +603,23 @@ app.post('/webhook', async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    // Handle regular message with timestamp context
-    await handleMessage(from, trader, message, messageTimestamp);
+    // Detect multi-line/multi-item messages (expenses, transactions listed vertically)
+    const lineCount = message.split('\n').filter(line => line.trim()).length;
+    const isMultiItem = lineCount > 3; // More than 3 lines = likely multi-item
 
+    if (isMultiItem) {
+      // Send immediate acknowledgment for multi-item messages
+      console.log(`📝 Multi-item message detected (${lineCount} lines) - sending immediate ack`);
+      await sendMessage(from, `📝 Recording ${lineCount} items...`);
+    }
+
+    // Respond immediately to Twilio (prevents timeout)
     res.status(200).send('OK');
+
+    // Process message in background (don't wait for Twilio)
+    handleMessage(from, trader, message, messageTimestamp).catch(error => {
+      console.error(`❌ Background processing error for ${from}:`, error);
+    });
   } catch (error) {
     console.error('❌ Webhook error:', error);
     res.status(500).send('Error');
