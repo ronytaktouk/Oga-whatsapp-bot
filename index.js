@@ -751,7 +751,7 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
     console.log(`🤖 Calling Claude (${CLAUDE_MODEL}) for ${trader.name}...`);
     const response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 500,
+      max_tokens: 1024,
       system: [
         {
           type: 'text',
@@ -762,8 +762,19 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
       messages: messages,
     });
 
-    const fullText = response.content[0].text;
-    console.log(`✅ Claude responded (${fullText.length} chars)`);
+    // Newer models can return other block types (e.g. thinking) before the text,
+    // so collect every text block instead of assuming the first one is text.
+    const fullText = (response.content || [])
+      .filter((block) => block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')
+      .trim();
+
+    if (!fullText) {
+      const types = (response.content || []).map((b) => b.type).join(', ') || 'none';
+      throw new Error(`Claude returned no text (stop_reason: ${response.stop_reason}, blocks: ${types})`);
+    }
+    console.log(`✅ Claude responded (${fullText.length} chars, stop_reason: ${response.stop_reason})`);
 
     // Remove all [TRANSACTION] blocks from what the trader sees
     const responseText = fullText
