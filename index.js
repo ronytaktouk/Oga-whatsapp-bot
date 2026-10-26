@@ -17,6 +17,110 @@ const {
   formatNaira,
   extractAmounts
 } = require('./helpers');
+const moment = require('moment-timezone');
+
+// ============================================
+// TIME, NUMBERS AND SAFETY HELPERS
+// ============================================
+
+const TZ = 'Africa/Lagos';
+const TRANSACTION_TYPES = ['sale', 'purchase', 'expense', 'payment_in', 'payment_out'];
+const DAILY_MESSAGE_CAP = parseInt(process.env.DAILY_MESSAGE_CAP || '150', 10);
+
+/** Today's date in Lagos time, e.g. "2026-10-26" */
+function lagosToday() {
+  return moment.tz(TZ).format('YYYY-MM-DD');
+}
+
+/** Store numbers as "+234..." — the same format works for Twilio and Meta later */
+function normalizeNumber(phone) {
+  return (phone || '').replace(/^whatsapp:/, '').trim();
+}
+
+/** Twilio needs the "whatsapp:" prefix when sending */
+function toWhatsApp(phone) {
+  return phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
+}
+
+/** Turn 5000, "5,000" or "₦5,000" into a number. Returns null if it is not a number. */
+function toNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const n = parseFloat(String(value).replace(/[₦,\s]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Clean up a party name ("null" or blank → null) */
+function cleanParty(party) {
+  if (!party) return null;
+  const p = String(party).trim();
+  return !p || p.toLowerCase() === 'null' ? null : p;
+}
+
+/**
+ * Check the numbers in a transaction before it is saved.
+ * Returns a cleaned transaction, or null if it should not be saved.
+ * Paid + balance always adds up to the total.
+ */
+function sanitizeTransaction(tx, fallbackDate) {
+  if (!tx || !TRANSACTION_TYPES.includes(tx.type)) return null;
+
+  const amount = toNumber(tx.amount);
+  if (amount === null || amount <= 0) return null;
+
+  let paid = toNumber(tx.paid);
+  let balance = toNumber(tx.balance);
+
+  if (tx.type === 'sale' || tx.type === 'purchase') {
+    if (paid === null && balance === null) paid = amount; // nothing said = fully paid
+    else if (paid === null) paid = amount - balance;
+    paid = Math.min(Math.max(paid, 0), amount);
+    balance = amount - paid;
+  } else {
+    paid = amount;
+    balance = 0;
+  }
+
+  const date = tx.transaction_date && !isNaN(Date.parse(tx.transaction_date))
+    ? tx.transaction_date
+    : fallbackDate.toISOString();
+
+  return {
+    ...tx,
+    amount,
+    paid,
+    balance,
+    party: cleanParty(tx.party),
+    item: tx.item && String(tx.item).toLowerCase() !== 'null' ? tx.item : null,
+    transaction_date: date,
+  };
+}
+
+// Twilio sometimes resends the same message. Remember recent message IDs to skip repeats.
+const recentMessageIds = new Set();
+function isDuplicateMessage(messageSid) {
+  if (!messageSid) return false;
+  if (recentMessageIds.has(messageSid)) return true;
+  recentMessageIds.add(messageSid);
+  if (recentMessageIds.size > 2000) {
+    recentMessageIds.delete(recentMessageIds.values().next().value);
+  }
+  return false;
+}
+
+// Daily message counter per trader (resets each Lagos day, and on restart)
+const dailyCounts = new Map();
+let dailyCountsDate = lagosToday();
+function countMessage(phone) {
+  const today = lagosToday();
+  if (today !== dailyCountsDate) {
+    dailyCounts.clear();
+    dailyCountsDate = today;
+  }
+  const count = (dailyCounts.get(phone) || 0) + 1;
+  dailyCounts.set(phone, count);
+  return count;
+}
 
 // ============================================
 // ADDITIONAL HELPER FUNCTIONS
@@ -214,12 +318,33 @@ const twilioClient = twilio(
  * Get trader by WhatsApp number
  */
 async function getTrader(phone) {
+  const number = normalizeNumber(phone);
+
   const { data, error } = await supabase
     .from('traders')
     .select('*')
-    .eq('whatsapp_number', phone)
-    .single();
-  return data;
+    .eq('whatsapp_number', number)
+    .maybeSingle();
+  if (error) console.error('❌ Error finding trader:', error);
+  if (data) return data;
+
+  // Older records were saved as "whatsapp:+234...". Find them and move them to the new format.
+  const { data: legacy } = await supabase
+    .from('traders')
+    .select('*')
+    .eq('whatsapp_number', `whatsapp:${number}`)
+    .maybeSingle();
+  if (!legacy) return null;
+
+  const { error: updateError } = await supabase
+    .from('traders')
+    .update({ whatsapp_number: number })
+    .eq('id', legacy.id);
+  if (updateError) {
+    console.error('⚠️ Could not update number format, keeping old one:', updateError);
+    return legacy;
+  }
+  return { ...legacy, whatsapp_number: number };
 }
 
 /**
@@ -229,7 +354,7 @@ async function createTrader(phone) {
   const { data, error } = await supabase
     .from('traders')
     .insert({
-      whatsapp_number: phone,
+      whatsapp_number: normalizeNumber(phone),
       subscription_tier: 'trial',
       trial_start: new Date(),
       trial_end: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000), // 14 days
@@ -278,6 +403,80 @@ async function saveTransaction(traderId, txData) {
 }
 
 /**
+ * Apply a correction from the trader ("no be 5k na 3k", or delete after YES).
+ * Targets the most recent transaction, or the most recent one with the named person.
+ */
+async function applyCorrection(traderId, correction) {
+  let query = supabase
+    .from('transactions')
+    .select('*')
+    .eq('trader_id', traderId)
+    .in('type', TRANSACTION_TYPES);
+
+  const party = cleanParty(correction.party);
+  if (party) query = query.ilike('party_name', party);
+
+  const { data: rows, error } = await query
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (error || !rows || rows.length === 0) {
+    console.error('⚠️ Correction: no matching transaction found', error || '');
+    return false;
+  }
+  const target = rows[0];
+
+  if (correction.action === 'delete') {
+    const { error: deleteError } = await supabase
+      .from('transactions')
+      .delete()
+      .eq('id', target.id);
+    if (deleteError) {
+      console.error('❌ Correction delete error:', deleteError);
+      return false;
+    }
+    console.log(`🗑️ Deleted transaction ${target.id}`);
+    return true;
+  }
+
+  if (correction.action === 'update') {
+    const newAmount = toNumber(correction.amount) ?? Number(target.total_amount);
+    if (!(newAmount > 0)) return false;
+
+    let newPaid = newAmount;
+    if (target.type === 'sale' || target.type === 'purchase') {
+      if (toNumber(correction.paid) !== null) newPaid = toNumber(correction.paid);
+      else if (toNumber(correction.balance) !== null) newPaid = newAmount - toNumber(correction.balance);
+      else if (Number(target.balance_remaining) === 0) newPaid = newAmount; // was fully paid, still is
+      else newPaid = Number(target.amount_paid) || 0;
+      newPaid = Math.min(Math.max(newPaid, 0), newAmount);
+    }
+
+    const updates = {
+      total_amount: newAmount,
+      amount_paid: newPaid,
+      balance_remaining: newAmount - newPaid,
+    };
+    if (correction.item && String(correction.item).toLowerCase() !== 'null') {
+      updates.item_description = correction.item;
+    }
+
+    const { error: updateError } = await supabase
+      .from('transactions')
+      .update(updates)
+      .eq('id', target.id);
+    if (updateError) {
+      console.error('❌ Correction update error:', updateError);
+      return false;
+    }
+    console.log(`✏️ Corrected transaction ${target.id} to ${newAmount}`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Save conversation history
  */
 async function saveConversationHistory(traderId, role, content) {
@@ -288,6 +487,7 @@ async function saveConversationHistory(traderId, role, content) {
       role: role,
       content: content,
     });
+  if (error) console.error('❌ Error saving conversation:', error);
 
   // Keep only last 20 messages
   const { data: allMessages } = await supabase
@@ -311,13 +511,14 @@ async function saveConversationHistory(traderId, role, content) {
  * Load trader context for Claude
  */
 async function loadTraderContext(traderId, userMessage = '') {
-  const today = new Date().toISOString().split('T')[0];
+  const today = lagosToday();
 
-  // Get recent transactions
+  // Get recent transactions (skips any old empty "none" rows)
   const { data: transactions, error: txError } = await supabase
     .from('transactions')
     .select('*')
     .eq('trader_id', traderId)
+    .in('type', TRANSACTION_TYPES)
     .order('created_at', { ascending: false })
     .limit(50);
   if (txError) console.error('❌ Error loading transactions:', txError);
@@ -359,24 +560,17 @@ async function loadTraderContext(traderId, userMessage = '') {
     .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
     .slice(0, 20);
 
-  // Calculate today's summary
+  // Calculate today's summary (in Lagos time)
+  const isToday = (t) =>
+    t.transaction_date && moment.tz(t.transaction_date, TZ).format('YYYY-MM-DD') === today;
+
   const todaySales = transactions
-    ?.filter(
-      (t) =>
-        t.type === 'sale' &&
-        t.transaction_date &&
-        t.transaction_date.startsWith(today)
-    )
-    .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+    ?.filter((t) => t.type === 'sale' && isToday(t))
+    .reduce((sum, t) => sum + (Number(t.total_amount) || 0), 0) || 0;
 
   const todayExpenses = transactions
-    ?.filter(
-      (t) =>
-        t.type === 'expense' &&
-        t.transaction_date &&
-        t.transaction_date.startsWith(today)
-    )
-    .reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0;
+    ?.filter((t) => t.type === 'expense' && isToday(t))
+    .reduce((sum, t) => sum + (Number(t.total_amount) || 0), 0) || 0;
 
   // Check if user is asking for a summary
   let summaryData = null;
@@ -409,19 +603,15 @@ async function sendMessage(to, message) {
     for (const chunk of chunks) {
       await twilioClient.messages.create({
         from: process.env.TWILIO_WHATSAPP_NUMBER,
-        to: to,
+        to: toWhatsApp(to),
         body: chunk,
       });
     }
     console.log(`📤 Message sent to ${to}`);
   } catch (error) {
+    // Only log. The old code put OGA's own reply into the incoming message queue,
+    // which would later be processed as if the trader had sent it.
     console.error('❌ Error sending message:', error);
-    // Queue the message for retry
-    await supabase.from('message_queue').insert({
-      whatsapp_number: to,
-      message_content: message,
-      received_at: new Date()
-    });
   }
 }
 
@@ -465,18 +655,19 @@ async function handleOnboarding(from, trader, message) {
 // MESSAGE HANDLER - MAIN LOGIC
 // ============================================
 
-async function handleMessage(from, trader, message, messageTimestamp = new Date()) {
+async function handleMessage(from, trader, message, messageTimestamp = new Date(), options = {}) {
+  let recordsTouched = false;
   try {
     // Load trader context (pass message for summary detection)
     const context = await loadTraderContext(trader.id, message);
 
-    // Format message date for Claude context
-    const messageDateStr = messageTimestamp.toISOString().split('T')[0];
+    // Format message date for Claude context (Lagos time)
     const messageDateFormatted = messageTimestamp.toLocaleDateString('en-US', {
       weekday: 'long',
       year: 'numeric',
       month: 'long',
-      day: 'numeric'
+      day: 'numeric',
+      timeZone: TZ,
     });
 
     // Build conversation history for Claude
@@ -574,45 +765,49 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
     const fullText = response.content[0].text;
     console.log(`✅ Claude responded (${fullText.length} chars)`);
 
-    // Parse transaction if present
-    const transactionMatch = fullText.match(
-      /\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/
-    );
-    let transaction = null;
-    let responseText = fullText;
+    // Remove all [TRANSACTION] blocks from what the trader sees
+    const responseText = fullText
+      .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
+      .trim();
 
-    if (transactionMatch) {
+    // From here on, records may be saved. If anything fails after this point,
+    // the message must NOT be retried, or the sale would be saved twice.
+    recordsTouched = true;
+
+    // Read EVERY transaction block (multi-item messages have several)
+    const blocks = [...fullText.matchAll(/\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/g)];
+    let savedCount = 0;
+
+    for (const block of blocks) {
+      let tx;
       try {
-        transaction = JSON.parse(transactionMatch[1].trim());
-        console.log(`✅ Transaction detected: ${transaction.type}`);
-
-        // Auto-detect business type if not provided
-        if (!transaction.business_type) {
-          transaction.business_type = detectBusinessType(message);
-        }
-
-        // Remove the [TRANSACTION] block from user response
-        responseText = fullText
-          .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
-          .trim();
+        tx = JSON.parse(block[1].trim());
       } catch (e) {
         console.error('⚠️ Transaction parse error:', e.message);
-        // Still remove the block even if parsing failed
-        responseText = fullText
-          .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
-          .trim();
+        continue;
       }
-    }
 
-    // Save transaction if detected
-    if (transaction) {
-      // Use message timestamp as default transaction date if not provided by Claude
-      if (!transaction.transaction_date) {
-        transaction.transaction_date = messageTimestamp.toISOString();
+      if (!tx || tx.type === 'none') continue;
+
+      if (tx.type === 'correction') {
+        await applyCorrection(trader.id, tx);
+        continue;
       }
-      await saveTransaction(trader.id, transaction);
-      console.log(`💾 Saved transaction: ${transaction.type} on ${transaction.transaction_date}`);
+
+      const clean = sanitizeTransaction(tx, messageTimestamp);
+      if (!clean) {
+        console.error('⚠️ Skipped invalid transaction:', JSON.stringify(tx));
+        continue;
+      }
+      if (!clean.business_type) clean.business_type = detectBusinessType(message);
+
+      const saved = await saveTransaction(trader.id, clean);
+      if (saved) {
+        savedCount++;
+        console.log(`💾 Saved ${clean.type} ₦${clean.amount} (paid ${clean.paid}, balance ${clean.balance})`);
+      }
     }
+    if (blocks.length > 0) console.log(`📒 ${savedCount} of ${blocks.length} blocks saved`);
 
     // Save conversation history
     await saveConversationHistory(trader.id, 'user', message);
@@ -631,19 +826,47 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
   } catch (error) {
     console.error('❌ Error handling message:', error);
 
+    // Records were already saved, so retrying would duplicate them. Stop here.
+    if (recordsTouched) return;
+
+    // A retry from the queue failed again: log it and stop, so it can't loop forever.
+    if (options.fromQueue) {
+      console.error(`❌ Queued message from ${from} failed again, not retrying`);
+      return;
+    }
+
     // Send error message to user
     await sendMessage(
       from,
       'OGA is resting briefly 😴\nYour message is safe and waiting.\nBack in under 5 minutes. Sorry for the wait 🙏'
     );
 
-    // Queue the message for retry
+    // Queue the message for retry (crons.js picks it up every 5 minutes)
     await supabase.from('message_queue').insert({
-      whatsapp_number: from,
+      whatsapp_number: normalizeNumber(from),
       message_content: message,
-      received_at: new Date()
+      received_at: messageTimestamp,
+      processed: false,
     });
   }
+}
+
+/**
+ * Re-run a message that failed earlier (called by the queue job in crons.js)
+ */
+async function processQueuedMessage(whatsappNumber, content, receivedAt) {
+  const trader = await getTrader(whatsappNumber);
+  if (!trader) {
+    console.error(`⚠️ Queued message: no trader for ${whatsappNumber}`);
+    return;
+  }
+  await handleMessage(
+    normalizeNumber(whatsappNumber),
+    trader,
+    content,
+    receivedAt ? new Date(receivedAt) : new Date(),
+    { fromQueue: true }
+  );
 }
 
 // ============================================
@@ -652,20 +875,51 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
 
 app.post('/webhook', async (req, res) => {
   try {
-    const from = req.body.From;
+    // 1. Only accept requests that really come from Twilio.
+    // Set SKIP_TWILIO_VALIDATION=true in Railway only for emergency debugging.
+    if (process.env.SKIP_TWILIO_VALIDATION !== 'true') {
+      const signature = req.get('X-Twilio-Signature') || '';
+      const url = process.env.WEBHOOK_URL || `https://${req.get('host')}${req.originalUrl}`;
+      const valid = twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, signature, url, req.body);
+      if (!valid) {
+        console.error(`🚫 Rejected request with invalid Twilio signature (checked against ${url})`);
+        return res.status(403).send('Forbidden');
+      }
+    }
+
+    // 2. Skip messages Twilio has already sent once
+    if (isDuplicateMessage(req.body.MessageSid)) {
+      console.log(`🔁 Duplicate message ${req.body.MessageSid} skipped`);
+      return res.status(200).send('OK');
+    }
+
+    const from = normalizeNumber(req.body.From);
     const message = req.body.Body?.trim();
     const messageTimestamp = req.body.Timestamp ? new Date(parseInt(req.body.Timestamp) * 1000) : new Date();
 
-    if (!from || !message) {
-      return res.status(400).send('Missing From or Body');
+    if (!from) {
+      return res.status(400).send('Missing From');
     }
 
-    console.log(`📨 Message from ${from} [${messageTimestamp.toISOString()}]: ${message.substring(0, 50)}...`);
+    // 3. Voice notes, photos and other media with no text
+    if (!message) {
+      if (parseInt(req.body.NumMedia || '0', 10) > 0) {
+        await sendMessage(
+          from,
+          `I see your voice note or picture 🙏 I no fit read those yet — abeg type am for me.`
+        );
+      }
+      return res.status(200).send('OK');
+    }
+
+    // Log without the message text (traders' money details stay out of the logs)
+    console.log(`📨 Message from ${from} [${messageTimestamp.toISOString()}] (${message.length} chars)`);
 
     // Get or create trader
     let trader = await getTrader(from);
     if (!trader) {
       trader = await createTrader(from);
+      if (!trader) return res.status(500).send('Error');
       console.log(`✨ New trader created: ${from}`);
 
       await sendMessage(
@@ -678,6 +932,18 @@ app.post('/webhook', async (req, res) => {
     // Check if onboarding incomplete
     if (!trader.name || !trader.pin) {
       await handleOnboarding(from, trader, message);
+      return res.status(200).send('OK');
+    }
+
+    // 4. Daily message cap (protects costs; set DAILY_MESSAGE_CAP in Railway)
+    const count = countMessage(from);
+    if (count > DAILY_MESSAGE_CAP) {
+      if (count === DAILY_MESSAGE_CAP + 1) {
+        await sendMessage(
+          from,
+          `You don reach today's message limit 🙏 OGA go dey ready for you again tomorrow morning.`
+        );
+      }
       return res.status(200).send('OK');
     }
 
@@ -725,6 +991,6 @@ app.listen(PORT, () => {
   console.log('❤️  Health: http://localhost:' + PORT + '/health');
   console.log('='.repeat(50) + '\n');
 
-  // Initialize cron jobs
-  initializeCrons(supabase, twilioClient, anthropic);
+  // Initialize cron jobs (the queue job needs a way to re-run failed messages)
+  initializeCrons(supabase, twilioClient, anthropic, { processQueuedMessage });
 });

@@ -1,14 +1,22 @@
 // Cron Jobs for OGA Bot
-// Scheduled tasks that run automatically
+// Scheduled tasks that run automatically.
+// All daily jobs run on Lagos time (the server itself runs on UTC).
 
 const schedule = require('node-schedule');
 const moment = require('moment-timezone');
+
+const TZ = 'Africa/Lagos';
+
+/** Twilio needs the "whatsapp:" prefix; numbers are stored as "+234..." */
+function toWhatsApp(phone) {
+  return phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
+}
 
 // ============================================
 // INITIALIZE ALL CRON JOBS
 // ============================================
 
-function initializeCrons(supabase, twilioClient, anthropic) {
+function initializeCrons(supabase, twilioClient, anthropic, options = {}) {
   console.log('🕐 Initializing cron jobs...');
 
   // ============================================
@@ -16,8 +24,6 @@ function initializeCrons(supabase, twilioClient, anthropic) {
   // ============================================
   schedule.scheduleJob('*/15 * * * *', async () => {
     try {
-      console.log('📬 Checking for due reminders...');
-
       const now = new Date();
       const { data: dueReminders, error } = await supabase
         .from('reminders')
@@ -30,44 +36,39 @@ function initializeCrons(supabase, twilioClient, anthropic) {
         return;
       }
 
-      if (dueReminders && dueReminders.length > 0) {
-        for (const reminder of dueReminders) {
-          const trader = await supabase
-            .from('traders')
-            .select('whatsapp_number, name')
-            .eq('id', reminder.trader_id)
-            .single();
+      for (const reminder of dueReminders || []) {
+        const { data: trader } = await supabase
+          .from('traders')
+          .select('whatsapp_number, name')
+          .eq('id', reminder.trader_id)
+          .maybeSingle();
 
-          if (trader.data) {
-            const message = reminder.message || `Reminder: ${reminder.description || 'Check your pending items'}`;
+        if (!trader) continue;
 
-            // Send reminder via Twilio
-            await twilioClient.messages.create({
-              from: process.env.TWILIO_WHATSAPP_NUMBER,
-              to: trader.data.whatsapp_number,
-              body: message
-            });
+        const message = reminder.message || `Reminder: ${reminder.description || 'Check your pending items'}`;
 
-            console.log(`✅ Sent reminder to ${trader.data.name}`);
+        try {
+          await twilioClient.messages.create({
+            from: process.env.TWILIO_WHATSAPP_NUMBER,
+            to: toWhatsApp(trader.whatsapp_number),
+            body: message,
+          });
+          console.log(`✅ Sent reminder to ${trader.name}`);
+        } catch (sendError) {
+          console.error(`❌ Could not send reminder to ${trader.name}:`, sendError.message);
+          continue; // leave it pending, try again next run
+        }
 
-            // Update reminder status
-            await supabase
-              .from('reminders')
-              .update({ status: 'sent' })
-              .eq('id', reminder.id);
-
-            // If recurring, schedule next one
-            if (reminder.recurring) {
-              const nextDue = calculateNextDue(reminder);
-              await supabase
-                .from('reminders')
-                .update({
-                  scheduled_time: nextDue,
-                  status: 'pending'
-                })
-                .eq('id', reminder.id);
-            }
-          }
+        if (reminder.recurring) {
+          await supabase
+            .from('reminders')
+            .update({ scheduled_time: calculateNextDue(reminder.scheduled_time, reminder.recurring) })
+            .eq('id', reminder.id);
+        } else {
+          await supabase
+            .from('reminders')
+            .update({ status: 'sent' })
+            .eq('id', reminder.id);
         }
       }
     } catch (error) {
@@ -78,15 +79,12 @@ function initializeCrons(supabase, twilioClient, anthropic) {
   // ============================================
   // 2. RECURRING TRANSACTIONS — Daily 8am Lagos time
   // ============================================
-  schedule.scheduleJob('0 8 * * *', async () => {
+  schedule.scheduleJob({ rule: '0 8 * * *', tz: TZ }, async () => {
     try {
-      // Check if current time is in Lagos timezone (convert to Lagos time)
-      const lagosTime = moment.tz('Africa/Lagos');
-      if (lagosTime.hour() !== 8 || lagosTime.minute() !== 0) return; // Only run at exact 8am Lagos
-
+      const lagosNow = moment.tz(TZ);
       console.log('🔄 Checking for recurring transactions due today...');
 
-      const today = lagosTime.format('YYYY-MM-DD');
+      const today = lagosNow.format('YYYY-MM-DD');
       const { data: recurringTxs, error } = await supabase
         .from('recurring_transactions')
         .select('*')
@@ -98,34 +96,40 @@ function initializeCrons(supabase, twilioClient, anthropic) {
         return;
       }
 
-      if (recurringTxs && recurringTxs.length > 0) {
-        for (const tx of recurringTxs) {
-          const trader = await supabase
-            .from('traders')
-            .select('whatsapp_number, name')
-            .eq('id', tx.trader_id)
-            .single();
+      for (const tx of recurringTxs || []) {
+        const { data: trader } = await supabase
+          .from('traders')
+          .select('whatsapp_number, name')
+          .eq('id', tx.trader_id)
+          .maybeSingle();
 
-          if (trader.data) {
-            const prompt = `It is ${lagosTime.format('dddd')} ${trader.data.name}.
-Your ${tx.description} of ₦${tx.amount.toLocaleString()} is due today.
-Have you paid/received it? Reply YES to record it.`;
+        if (!trader) continue;
 
-            await twilioClient.messages.create({
-              from: process.env.TWILIO_WHATSAPP_NUMBER,
-              to: trader.data.whatsapp_number,
-              body: prompt
-            });
+        const amount = Number(tx.amount) || 0;
+        const prompt = `It is ${lagosNow.format('dddd')} ${trader.name}.
+Your ${tx.description} of ₦${amount.toLocaleString()} is due today.
+Have you paid or received it? Tell me and I go record am.`;
 
-            console.log(`✅ Prompted ${trader.data.name} for recurring transaction`);
-
-            // Update last prompted time
-            await supabase
-              .from('recurring_transactions')
-              .update({ last_prompted: new Date().toISOString() })
-              .eq('id', tx.id);
-          }
+        try {
+          await twilioClient.messages.create({
+            from: process.env.TWILIO_WHATSAPP_NUMBER,
+            to: toWhatsApp(trader.whatsapp_number),
+            body: prompt,
+          });
+          console.log(`✅ Prompted ${trader.name} for recurring transaction`);
+        } catch (sendError) {
+          console.error(`❌ Could not prompt ${trader.name}:`, sendError.message);
+          continue;
         }
+
+        // Move next_due forward so the trader is not prompted again tomorrow
+        await supabase
+          .from('recurring_transactions')
+          .update({
+            last_prompted: new Date().toISOString(),
+            next_due: moment.tz(calculateNextDue(tx.next_due, tx.frequency), TZ).format('YYYY-MM-DD'),
+          })
+          .eq('id', tx.id);
       }
     } catch (error) {
       console.error('❌ Cron error - Recurring transactions:', error);
@@ -133,54 +137,47 @@ Have you paid/received it? Reply YES to record it.`;
   });
 
   // ============================================
-  // 3. INACTIVE USER CHECK — Daily 10am Lagos time
+  // 3. INACTIVE USER CHECK — Daily 10am Lagos time, not on Sundays
+  // Each trader gets ONE check-in per silence: only traders whose last
+  // message was 5 days ago (5-7 days on Monday, to cover the skipped Sunday).
   // ============================================
-  schedule.scheduleJob('0 10 * * *', async () => {
+  schedule.scheduleJob({ rule: '0 10 * * *', tz: TZ }, async () => {
     try {
-      const lagosTime = moment.tz('Africa/Lagos');
-      if (lagosTime.hour() !== 10 || lagosTime.minute() !== 0) return; // Only run at exact 10am Lagos
+      const lagosNow = moment.tz(TZ);
+      if (lagosNow.day() === 0) return; // Sunday
 
       console.log('👤 Checking for inactive users...');
 
-      const fiveDaysAgo = lagosTime.subtract(5, 'days').toISOString();
+      const windowDays = lagosNow.day() === 1 ? 2 : 1; // Monday also covers Sunday
+      const newerLimit = lagosNow.clone().subtract(5, 'days').toISOString();
+      const olderLimit = lagosNow.clone().subtract(5 + windowDays, 'days').toISOString();
+
       const { data: inactiveUsers, error } = await supabase
         .from('traders')
         .select('id, whatsapp_number, name, last_active')
         .eq('is_active', true)
-        .lt('last_active', fiveDaysAgo);
+        .lt('last_active', newerLimit)
+        .gte('last_active', olderLimit);
 
       if (error) {
         console.error('❌ Error fetching inactive users:', error);
         return;
       }
 
-      if (inactiveUsers && inactiveUsers.length > 0) {
-        for (const user of inactiveUsers) {
-          // Check if already messaged recently (prevent spam)
-          const recentMessage = await supabase
-            .from('reminders')
-            .select('id')
-            .eq('trader_id', user.id)
-            .gte('created_at', lagosTime.subtract(1, 'day').toISOString())
-            .single();
+      for (const user of inactiveUsers || []) {
+        if (!user.name) continue;
+        const message = `${user.name}, hope everything dey fine with you and the business 🙏
+Whenever you ready, just tell me wetin happen and I go record am.`;
 
-          if (!recentMessage.data) {
-            // Only message on weekdays, not on Sunday
-            if (lagosTime.day() !== 0) {
-              // Not Sunday
-              const message = `${user.name} — hope everything is fine with you and the business.
-Quick update while you were away:
-Just message me when you are ready to continue 🙏`;
-
-              await twilioClient.messages.create({
-                from: process.env.TWILIO_WHATSAPP_NUMBER,
-                to: user.whatsapp_number,
-                body: message
-              });
-
-              console.log(`✅ Sent check-in message to ${user.name}`);
-            }
-          }
+        try {
+          await twilioClient.messages.create({
+            from: process.env.TWILIO_WHATSAPP_NUMBER,
+            to: toWhatsApp(user.whatsapp_number),
+            body: message,
+          });
+          console.log(`✅ Sent check-in message to ${user.name}`);
+        } catch (sendError) {
+          console.error(`❌ Could not send check-in to ${user.name}:`, sendError.message);
         }
       }
     } catch (error) {
@@ -190,41 +187,49 @@ Just message me when you are ready to continue 🙏`;
 
   // ============================================
   // 4. MESSAGE QUEUE PROCESSOR — Every 5 minutes
+  // Re-runs messages that failed earlier (the trader was told
+  // "Your message is safe and waiting"). The old version only marked
+  // them as processed, so they were silently thrown away.
   // ============================================
   schedule.scheduleJob('*/5 * * * *', async () => {
     try {
-      console.log('📤 Processing message queue...');
-
       const { data: queuedMessages, error } = await supabase
         .from('message_queue')
         .select('*')
         .eq('processed', false)
-        .limit(10)
-        .order('received_at', { ascending: true });
+        .order('received_at', { ascending: true })
+        .limit(10);
 
       if (error) {
         console.error('❌ Error fetching queued messages:', error);
         return;
       }
 
-      if (queuedMessages && queuedMessages.length > 0) {
-        console.log(`📨 Found ${queuedMessages.length} queued messages`);
+      if (!queuedMessages || queuedMessages.length === 0) return;
+      console.log(`📨 Found ${queuedMessages.length} queued messages`);
 
-        for (const queuedMsg of queuedMessages) {
-          try {
-            // Mark as processed
-            await supabase
-              .from('message_queue')
-              .update({
-                processed: true,
-                processed_at: new Date().toISOString()
-              })
-              .eq('id', queuedMsg.id);
+      for (const queuedMsg of queuedMessages) {
+        // Mark as processed FIRST, so a message is never run twice
+        const { error: markError } = await supabase
+          .from('message_queue')
+          .update({ processed: true, processed_at: new Date().toISOString() })
+          .eq('id', queuedMsg.id);
+        if (markError) {
+          console.error('❌ Could not mark queued message:', markError);
+          continue;
+        }
 
-            console.log(`✅ Processed queued message from ${queuedMsg.whatsapp_number}`);
-          } catch (processingError) {
-            console.error('❌ Error processing queued message:', processingError);
-          }
+        if (!options.processQueuedMessage) continue;
+
+        try {
+          await options.processQueuedMessage(
+            queuedMsg.whatsapp_number,
+            queuedMsg.message_content,
+            queuedMsg.received_at
+          );
+          console.log(`✅ Re-processed queued message from ${queuedMsg.whatsapp_number}`);
+        } catch (processingError) {
+          console.error('❌ Error processing queued message:', processingError);
         }
       }
     } catch (error) {
@@ -234,13 +239,11 @@ Just message me when you are ready to continue 🙏`;
 
   // ============================================
   // 5. MONTHLY PDF REPORT — 1st of month at 8am Lagos time
+  // NOT BUILT YET: this only logs. The monthly PDF still needs writing.
   // ============================================
-  schedule.scheduleJob('0 8 1 * *', async () => {
+  schedule.scheduleJob({ rule: '0 8 1 * *', tz: TZ }, async () => {
     try {
-      const lagosTime = moment.tz('Africa/Lagos');
-      if (lagosTime.hour() !== 8 || lagosTime.minute() !== 0) return; // Only run at exact 8am Lagos
-
-      console.log('📊 Generating monthly PDF reports...');
+      console.log('📊 Monthly PDF reports (not built yet)...');
 
       const { data: activeTraders, error } = await supabase
         .from('traders')
@@ -252,12 +255,8 @@ Just message me when you are ready to continue 🙏`;
         return;
       }
 
-      if (activeTraders && activeTraders.length > 0) {
-        for (const trader of activeTraders) {
-          // TODO: Generate PDF report for this trader
-          // For now, just log
-          console.log(`📄 Would generate PDF for ${trader.name}`);
-        }
+      for (const trader of activeTraders || []) {
+        console.log(`📄 Would generate PDF for ${trader.name}`);
       }
     } catch (error) {
       console.error('❌ Cron error - Monthly reports:', error);
@@ -268,19 +267,15 @@ Just message me when you are ready to continue 🙏`;
 }
 
 // ============================================
-// HELPER FUNCTION: Calculate next due date for recurring transactions
+// HELPER: next date for something that repeats
 // ============================================
 
-function calculateNextDue(reminder) {
-  let nextDue = moment.tz(reminder.scheduled_time, 'Africa/Lagos');
+function calculateNextDue(fromDate, frequency) {
+  let nextDue = moment.tz(fromDate, TZ);
 
-  if (reminder.recurring === 'daily') {
-    nextDue = nextDue.add(1, 'day');
-  } else if (reminder.recurring === 'weekly') {
-    nextDue = nextDue.add(1, 'week');
-  } else if (reminder.recurring === 'monthly') {
-    nextDue = nextDue.add(1, 'month');
-  }
+  if (frequency === 'daily') nextDue = nextDue.add(1, 'day');
+  else if (frequency === 'weekly') nextDue = nextDue.add(1, 'week');
+  else nextDue = nextDue.add(1, 'month'); // monthly, or unknown: wait a month rather than repeat daily
 
   return nextDue.toISOString();
 }
