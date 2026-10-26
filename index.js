@@ -186,10 +186,16 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 // INITIALIZE CLIENTS
 // ============================================
+// Uses the service role key if set (server-side only, bypasses Row Level Security),
+// otherwise falls back to the anon key. Never expose the service role key publicly.
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
 );
+
+// AI model is set by the CLAUDE_MODEL variable in Railway.
+// To switch or roll back, change the variable — no code change needed.
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-5-5';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -308,20 +314,50 @@ async function loadTraderContext(traderId, userMessage = '') {
   const today = new Date().toISOString().split('T')[0];
 
   // Get recent transactions
-  const { data: transactions } = await supabase
+  const { data: transactions, error: txError } = await supabase
     .from('transactions')
     .select('*')
     .eq('trader_id', traderId)
     .order('created_at', { ascending: false })
     .limit(50);
+  if (txError) console.error('❌ Error loading transactions:', txError);
 
-  // Get conversation history (reduced from 10 to 5 for better token efficiency)
-  const { data: history } = await supabase
+  // Get all party-linked transactions to work out who owes whom
+  const { data: partyTx, error: partyError } = await supabase
+    .from('transactions')
+    .select('party_name, type, total_amount, balance_remaining')
+    .eq('trader_id', traderId)
+    .not('party_name', 'is', null);
+  if (partyError) console.error('❌ Error loading balances:', partyError);
+
+  // Get conversation history (6 = 3 full exchanges)
+  const { data: history, error: historyError } = await supabase
     .from('conversation_history')
     .select('*')
     .eq('trader_id', traderId)
     .order('created_at', { ascending: false })
-    .limit(5);
+    .limit(6);
+  if (historyError) console.error('❌ Error loading history:', historyError);
+
+  // Work out balances per person
+  // Positive = they owe the trader. Negative = the trader owes them.
+  const balances = {};
+  (partyTx || []).forEach((t) => {
+    const name = (t.party_name || '').trim();
+    if (!name || name.toLowerCase() === 'null') return;
+    const key = name.toLowerCase();
+    if (!balances[key]) balances[key] = { name, amount: 0 };
+    const total = Number(t.total_amount) || 0;
+    const remaining = Number(t.balance_remaining) || 0;
+    if (t.type === 'sale') balances[key].amount += remaining;
+    else if (t.type === 'payment_in') balances[key].amount -= total;
+    else if (t.type === 'purchase') balances[key].amount -= remaining;
+    else if (t.type === 'payment_out') balances[key].amount += total;
+  });
+  const outstandingBalances = Object.values(balances)
+    .filter((b) => Math.round(b.amount) !== 0)
+    .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
+    .slice(0, 20);
 
   // Calculate today's summary
   const todaySales = transactions
@@ -358,6 +394,7 @@ async function loadTraderContext(traderId, userMessage = '') {
     todaySales,
     todayExpenses,
     recentTransactions: transactions?.slice(0, 10) || [],
+    outstandingBalances,
     conversationHistory: history || [],
     summaryData
   };
@@ -452,9 +489,43 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
         });
       });
     }
+    // Claude requires the conversation to start with a user message
+    while (messages.length > 0 && messages[0].role !== 'user') {
+      messages.shift();
+    }
+
+    // Build the trader's saved records so OGA remembers past transactions
+    let recordsBlock = `\n\n[BUSINESS_RECORDS]\n`;
+    recordsBlock += `These are this trader's saved records from the database. Use them to answer questions about past transactions and who owes whom. Never invent records that are not listed here.\n`;
+    recordsBlock += `Today so far: Sales ${formatNaira(context.todaySales)}, Expenses ${formatNaira(context.todayExpenses)}\n`;
+
+    if (context.outstandingBalances.length > 0) {
+      recordsBlock += `\nOutstanding balances:\n`;
+      context.outstandingBalances.forEach((b) => {
+        recordsBlock += b.amount > 0
+          ? `- ${b.name} owes the trader ${formatNaira(b.amount)}\n`
+          : `- The trader owes ${b.name} ${formatNaira(Math.abs(b.amount))}\n`;
+      });
+    } else {
+      recordsBlock += `\nOutstanding balances: none\n`;
+    }
+
+    if (context.recentTransactions.length > 0) {
+      recordsBlock += `\nLast ${context.recentTransactions.length} transactions (newest first):\n`;
+      context.recentTransactions.forEach((t) => {
+        const date = (t.transaction_date || t.created_at || '').toString().split('T')[0];
+        const parts = [date, t.type, t.party_name, t.item_description, formatNaira(t.total_amount || 0)];
+        if (t.amount_paid) parts.push(`paid ${formatNaira(t.amount_paid)}`);
+        if (t.balance_remaining) parts.push(`balance ${formatNaira(t.balance_remaining)}`);
+        recordsBlock += `- ${parts.filter(Boolean).join(' | ')}\n`;
+      });
+    } else {
+      recordsBlock += `\nNo transactions recorded yet.\n`;
+    }
+    recordsBlock += `[/BUSINESS_RECORDS]`;
 
     // Build user message with context
-    let userMessageContent = `[Sent: ${messageDateFormatted}]\n${message}`;
+    let userMessageContent = `[Sent: ${messageDateFormatted}]\n${message}${recordsBlock}`;
 
     // If summary is requested, add summary data to Claude's context
     if (context.summaryData) {
@@ -484,12 +555,19 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
     });
 
     // Call Claude API with system prompt
-    // Note: Prompt caching is automatically enabled by Claude SDK when system prompt is provided
-    console.log(`🤖 Calling Claude for ${trader.name}...`);
+    // Caching is NOT automatic: cache_control marks the fixed system prompt
+    // for caching, so repeat messages pay much less for it.
+    console.log(`🤖 Calling Claude (${CLAUDE_MODEL}) for ${trader.name}...`);
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: CLAUDE_MODEL,
       max_tokens: 500,
-      system: SYSTEM_PROMPT,
+      system: [
+        {
+          type: 'text',
+          text: SYSTEM_PROMPT,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
       messages: messages,
     });
 
