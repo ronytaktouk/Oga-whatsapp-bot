@@ -106,13 +106,28 @@ function createDashboardLink(traderId) {
   return `${publicBaseUrl()}/d/${token}`;
 }
 
+/** Catches typos like "dasboard", "dashbord", "dashbaord" (at most 2 letters off) */
+function looksLikeDashboard(word) {
+  if (word.length < 7 || word.length > 11 || !word.startsWith('da')) return false;
+  const target = 'dashboard';
+  const d = Array.from({ length: word.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= target.length; j++) d[0][j] = j;
+  for (let i = 1; i <= word.length; i++) {
+    for (let j = 1; j <= target.length; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (word[i - 1] === target[j - 1] ? 0 : 1));
+      if (i > 1 && j > 1 && word[i - 1] === target[j - 2] && word[i - 2] === target[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[word.length][target.length] <= 2;
+}
+
 /** Words that mean "send me my dashboard" */
 function isDashboardRequest(message) {
   const m = (message || '').toLowerCase().replace(/[^a-z ]/g, ' ').replace(/\s+/g, ' ').trim();
   if (!m) return false;
   const words = m.split(' ');
   // Short messages that mention the dashboard: "dashboard", "send me my dashboard link", "open dashboard abeg"
-  if (words.length <= 12 && /\b(dashboard|dash board|dashbord|dashbaord)\b/.test(m)) return true;
+  if (words.length <= 12 && (/\bdash ?board\b/.test(m) || words.some(looksLikeDashboard))) return true;
   // Very short requests for the book or the link
   return ['records', 'my records', 'my book', 'book', 'open book', 'open my book', 'link', 'my link', 'send link', 'send my link'].includes(m);
 }

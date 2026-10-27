@@ -824,44 +824,94 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
     // the message must NOT be retried, or the sale would be saved twice.
     recordsTouched = true;
 
-    // Read EVERY transaction block (multi-item messages have several)
-    const blocks = [...fullText.matchAll(/\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/g)];
-    let savedCount = 0;
+    // Read EVERY transaction block (multi-item messages have several) and save them
+    const saveBlocks = async (text) => {
+      const result = { blocks: 0, attempted: 0, saved: 0, corrections: 0 };
+      const blocks = [...text.matchAll(/\[TRANSACTION\]\s*(\{[\s\S]*?\})\s*\[\/TRANSACTION\]/g)];
+      result.blocks = blocks.length;
+      for (const block of blocks) {
+        let tx;
+        try {
+          tx = JSON.parse(block[1].trim());
+        } catch (e) {
+          console.error('⚠️ Transaction parse error:', e.message);
+          result.attempted++;
+          continue;
+        }
 
-    for (const block of blocks) {
-      let tx;
+        if (!tx || tx.type === 'none') continue;
+
+        if (tx.type === 'correction') {
+          result.corrections++;
+          await applyCorrection(trader.id, tx);
+          continue;
+        }
+
+        const clean = sanitizeTransaction(tx, messageTimestamp);
+        if (!clean) {
+          console.error('⚠️ Skipped invalid transaction:', JSON.stringify(tx));
+          continue;
+        }
+        if (!clean.business_type) clean.business_type = detectBusinessType(message);
+
+        result.attempted++;
+        const saved = await saveTransaction(trader.id, clean);
+        if (saved) {
+          result.saved++;
+          console.log(`💾 Saved ${clean.type} ₦${clean.amount} (paid ${clean.paid}, balance ${clean.balance})`);
+        }
+      }
+      if (blocks.length > 0) console.log(`📒 ${result.saved} of ${result.attempted} transactions saved`);
+      return result;
+    };
+
+    let saveResult = await saveBlocks(fullText);
+    let replyToSend = responseText;
+
+    // OGA said it recorded something but gave no record: ask once more for the record itself
+    const claimsRecorded = /\b(recorded|saved|logged|added)\b|✅/i.test(responseText);
+    if (claimsRecorded && saveResult.attempted === 0 && saveResult.corrections === 0) {
+      console.error('⚠️ Reply says "recorded" but has no record. Asking Claude for the record...');
       try {
-        tx = JSON.parse(block[1].trim());
-      } catch (e) {
-        console.error('⚠️ Transaction parse error:', e.message);
-        continue;
-      }
-
-      if (!tx || tx.type === 'none') continue;
-
-      if (tx.type === 'correction') {
-        await applyCorrection(trader.id, tx);
-        continue;
-      }
-
-      const clean = sanitizeTransaction(tx, messageTimestamp);
-      if (!clean) {
-        console.error('⚠️ Skipped invalid transaction:', JSON.stringify(tx));
-        continue;
-      }
-      if (!clean.business_type) clean.business_type = detectBusinessType(message);
-
-      const saved = await saveTransaction(trader.id, clean);
-      if (saved) {
-        savedCount++;
-        console.log(`💾 Saved ${clean.type} ₦${clean.amount} (paid ${clean.paid}, balance ${clean.balance})`);
+        const repair = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 2048,
+          output_config: { effort: process.env.OGA_EFFORT || 'low' },
+          system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+          messages: [
+            ...messages,
+            { role: 'assistant', content: fullText },
+            {
+              role: 'user',
+              content:
+                '[SYSTEM CHECK — not from the trader] Your reply says something was recorded, but you did not output any [TRANSACTION] block, so NOTHING was saved. If the trader\'s last message was a transaction, output ONLY the [TRANSACTION] block(s) for it now, with no other text. If nothing should be recorded, output only the word NONE.',
+            },
+          ],
+        });
+        const repairText = (repair.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+        const repaired = await saveBlocks(repairText);
+        saveResult = {
+          attempted: saveResult.attempted + repaired.attempted,
+          saved: saveResult.saved + repaired.saved,
+          corrections: saveResult.corrections + repaired.corrections,
+        };
+        console.log(`🔧 Repair: ${repaired.saved} of ${repaired.attempted} transactions saved`);
+      } catch (repairError) {
+        console.error('❌ Repair call failed:', repairError.message);
+        saveResult.attempted = Math.max(saveResult.attempted, 1); // treat as not saved
       }
     }
-    if (blocks.length > 0) console.log(`📒 ${savedCount} of ${blocks.length} blocks saved`);
+
+    // Never tell the trader something was recorded when it was not
+    if (saveResult.attempted > 0 && saveResult.saved === 0) {
+      replyToSend = `⚠️ I no fit save that one, so e never enter your book. Abeg send am again in a few minutes.`;
+    } else if (saveResult.saved < saveResult.attempted) {
+      replyToSend = `${responseText}\n\n⚠️ Only ${saveResult.saved} of ${saveResult.attempted} items saved. Type "dashboard" to check which ones, and send the missing ones again.`;
+    }
 
     // Save conversation history
     await saveConversationHistory(trader.id, 'user', message);
-    await saveConversationHistory(trader.id, 'assistant', responseText);
+    await saveConversationHistory(trader.id, 'assistant', replyToSend);
 
     // Update trader's last_active timestamp
     await supabase
@@ -870,8 +920,8 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
       .eq('id', trader.id);
 
     // Send response to user
-    console.log(`💬 Sending to ${from}: ${responseText.substring(0, 100)}...`);
-    await sendMessage(from, responseText);
+    console.log(`💬 Sending to ${from}: ${replyToSend.substring(0, 100)}...`);
+    await sendMessage(from, replyToSend);
 
   } catch (error) {
     console.error('❌ Error handling message:', error);
