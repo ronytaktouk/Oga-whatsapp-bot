@@ -188,6 +188,15 @@ function niceCategory(c) {
   return v.charAt(0).toUpperCase() + v.slice(1);
 }
 
+/** Any saved time → Lagos time. Times saved without a timezone are UTC (that is how the database stores them). */
+function lagos(value) {
+  if (!value) return moment.tz(TZ);
+  if (moment.isMoment(value) || value instanceof Date) return moment(value).tz(TZ);
+  const str = String(value).trim().replace(' ', 'T');
+  const hasZone = /(Z|[+-]\d{2}:?\d{2})$/i.test(str);
+  return (hasZone ? moment.parseZone(str) : moment.utc(str)).tz(TZ);
+}
+
 function monthOf(key) {
   const thisMonth = moment.tz(TZ).format('YYYY-MM');
   let m = /^\d{4}-\d{2}$/.test(key || '') ? key : thisMonth;
@@ -294,7 +303,7 @@ async function loadDashboard(supabase, traderId, month) {
   // Flag repeats: same type, person, item and amount on the same day as another record
   const seen = new Set();
   [...rows].reverse().forEach((t) => {
-    const day = moment.tz(t.transaction_date, TZ).format('YYYY-MM-DD');
+    const day = lagos(t.transaction_date).format('YYYY-MM-DD');
     const key = [t.type, (t.party_name || '').toLowerCase().trim(), (t.item_description || '').toLowerCase().trim(), Number(t.total_amount), day].join('|');
     if (seen.has(key)) t.repeat = true;
     else seen.add(key);
@@ -303,7 +312,7 @@ async function loadDashboard(supabase, traderId, month) {
   // Sales per day of the month
   const dailySales = Array.from({ length: month.daysInMonth() }, () => 0);
   rows.filter((t) => t.type === 'sale').forEach((t) => {
-    dailySales[moment.tz(t.transaction_date, TZ).date() - 1] += Number(t.total_amount) || 0;
+    dailySales[lagos(t.transaction_date).date() - 1] += Number(t.total_amount) || 0;
   });
 
   // Where the money went: stock + expense categories
@@ -397,7 +406,7 @@ function parseRecordForm(body, existing) {
   if (!day.isValid()) errors.date = 'Choose a date.';
   else if (day.isAfter(moment.tz(TZ), 'day')) errors.date = "The date can't be in the future.";
   else {
-    const old = existing ? moment.tz(existing.transaction_date, TZ) : null;
+    const old = existing ? lagos(existing.transaction_date) : null;
     if (old && old.format('YYYY-MM-DD') === date) when = old; // same day: keep the original time
     else if (day.isSame(moment.tz(TZ), 'day')) when = moment.tz(TZ);
     else when = day.clone().hour(12);
@@ -433,7 +442,7 @@ function valuesFromRecord(t) {
     item: cleanName(t.item_description) || '',
     category: cat && cat.toLowerCase() !== 'auto-detect' ? cat : '',
     project: cleanName(t.project) || '',
-    date: moment.tz(t.transaction_date, TZ).format('YYYY-MM-DD'),
+    date: lagos(t.transaction_date).format('YYYY-MM-DD'),
   };
 }
 
@@ -708,12 +717,12 @@ function changeLine(now, before, prevMonth) {
   return `<p class="change">Sales are ${pct > 0 ? 'up' : 'down'} ${Math.abs(pct)}% on ${prevMonth.format('MMMM')} (<span class="num">${naira(before)}</span>).</p>`;
 }
 
-function recordRow(t, monthKey = moment.tz(t.transaction_date, TZ).format('YYYY-MM')) {
+function recordRow(t, monthKey = lagos(t.transaction_date).format('YYYY-MM')) {
   const party = cleanName(t.party_name);
   const item = cleanName(t.item_description);
   const word = TYPE_WORDS[t.type] || t.type;
   const what = item || party || word;
-  const d = moment.tz(t.transaction_date, TZ);
+  const d = lagos(t.transaction_date);
   const meta = [`<span class="kind-m">${esc(word)}</span>`, item && party ? esc(party) : null].filter(Boolean).join('<span class="kind-m">, </span>');
   const balance = Number(t.balance_remaining) || 0;
   const balText = balance > 0 && t.type === 'sale' ? `${naira(balance)} still owed` : balance > 0 && t.type === 'purchase' ? `You owe ${naira(balance)}` : '';
@@ -752,7 +761,7 @@ function dashboardPage(trader, data, { type, q, notice }) {
   const today = moment.tz(TZ);
   const days = [];
   shown.forEach((t) => {
-    const d = moment.tz(t.transaction_date, TZ);
+    const d = lagos(t.transaction_date);
     const label = d.isSame(today, 'day') ? 'Today' : d.isSame(today.clone().subtract(1, 'day'), 'day') ? 'Yesterday' : d.format('dddd D MMMM');
     if (!days.length || days[days.length - 1].label !== label) days.push({ label, items: [] });
     days[days.length - 1].items.push(t);
@@ -887,7 +896,7 @@ function personPage(trader, name, rows) {
   const lines = rows.map((t) => {
     const effect = balanceEffect(t);
     running += effect;
-    const d = moment.tz(t.transaction_date, TZ);
+    const d = lagos(t.transaction_date);
     return `<tr>
   <td class="num">${d.format('D MMM YYYY')}</td>
   <td><a href="/dashboard/record/${enc(t.id)}?m=${d.format('YYYY-MM')}">${esc(TYPE_WORDS[t.type] || t.type)}</a>${cleanName(t.item_description) ? `<br><span class="note">${esc(t.item_description)}</span>` : ''}</td>
@@ -1094,7 +1103,7 @@ function setupDashboard(app, supabase) {
       return res.status(500).send(recordFormPage(ctx.trader, { mode: 'new', values: parsed.values, errors: { amount: 'The record did not save. Check your internet and try again.' }, monthKey, key: ctx.key }));
     }
     console.log(`➕ Dashboard: trader ${ctx.trader.id} added a ${parsed.fields.type}`);
-    res.redirect(303, `/dashboard?m=${moment.tz(parsed.fields.transaction_date, TZ).format('YYYY-MM')}&done=added`);
+    res.redirect(303, `/dashboard?m=${lagos(parsed.fields.transaction_date).format('YYYY-MM')}&done=added`);
   });
 
   // ---- Edit a record ----
@@ -1125,7 +1134,7 @@ function setupDashboard(app, supabase) {
       return res.status(500).send(recordFormPage(ctx.trader, { mode: 'edit', values: parsed.values, errors: { amount: 'Your change did not save. Check your internet and try again.' }, record, monthKey, key: ctx.key }));
     }
     console.log(`✏️ Dashboard: trader ${ctx.trader.id} edited record ${record.id}`);
-    res.redirect(303, `/dashboard?m=${moment.tz(parsed.fields.transaction_date, TZ).format('YYYY-MM')}&done=saved`);
+    res.redirect(303, `/dashboard?m=${lagos(parsed.fields.transaction_date).format('YYYY-MM')}&done=saved`);
   });
 
   // ---- Delete a record ----
@@ -1202,7 +1211,7 @@ function setupDashboard(app, supabase) {
     const rows = (await monthRows(supabase, ctx.trader.id, month)).reverse();
     const header = ['Date', 'Time', 'Kind', 'Customer or supplier', 'Item', 'Category', 'Project', 'Amount', 'Paid', 'Still owed'];
     const lines = rows.map((t) => {
-      const d = moment.tz(t.transaction_date, TZ);
+      const d = lagos(t.transaction_date);
       return [d.format('YYYY-MM-DD'), d.format('HH:mm'), TYPE_WORDS[t.type] || t.type, cleanName(t.party_name) || '', cleanName(t.item_description) || '', niceCategory(t.category), cleanName(t.project) || '', Number(t.total_amount) || 0, Number(t.amount_paid) || 0, Number(t.balance_remaining) || 0]
         .map(csvCell)
         .join(',');

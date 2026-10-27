@@ -27,6 +27,13 @@ const TZ = 'Africa/Lagos';
 const TRANSACTION_TYPES = ['sale', 'purchase', 'expense', 'payment_in', 'payment_out'];
 const DAILY_MESSAGE_CAP = parseInt(process.env.DAILY_MESSAGE_CAP || '150', 10);
 
+/** Any saved time → Lagos time. Times saved without a timezone are UTC. */
+function lagosTime(value) {
+  const str = String(value || '').trim().replace(' ', 'T');
+  if (!str) return moment.tz(TZ);
+  return (/(Z|[+-]\d{2}:?\d{2})$/i.test(str) ? moment.parseZone(str) : moment.utc(str)).tz(TZ);
+}
+
 /** Today's date in Lagos time, e.g. "2026-10-26" */
 function lagosToday() {
   return moment.tz(TZ).format('YYYY-MM-DD');
@@ -81,9 +88,18 @@ function sanitizeTransaction(tx, fallbackDate) {
     balance = 0;
   }
 
-  const date = tx.transaction_date && !isNaN(Date.parse(tx.transaction_date))
-    ? tx.transaction_date
-    : fallbackDate.toISOString();
+  // Use the real time the message arrived. Claude only decides the DAY (for "yesterday",
+  // "last Friday"): its times carry no timezone and used to come out an hour wrong.
+  const msgTime = moment(fallbackDate).tz(TZ);
+  const claudeDay = String(tx.transaction_date || '').match(/^\d{4}-\d{2}-\d{2}/);
+  let when = msgTime;
+  if (claudeDay) {
+    const day = moment.tz(claudeDay[0], 'YYYY-MM-DD', true, TZ);
+    if (day.isValid() && !day.isSame(msgTime, 'day') && day.isBefore(msgTime, 'day') && msgTime.diff(day, 'days') <= 366) {
+      when = day.clone().hour(12); // an earlier day: midday Lagos time
+    }
+  }
+  const date = when.toISOString();
 
   return {
     ...tx,
@@ -581,7 +597,7 @@ async function loadTraderContext(traderId, userMessage = '') {
 
   // Calculate today's summary (in Lagos time)
   const isToday = (t) =>
-    t.transaction_date && moment.tz(t.transaction_date, TZ).format('YYYY-MM-DD') === today;
+    t.transaction_date && lagosTime(t.transaction_date).format('YYYY-MM-DD') === today;
 
   const todaySales = transactions
     ?.filter((t) => t.type === 'sale' && isToday(t))
@@ -731,7 +747,7 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
     if (context.recentTransactions.length > 0) {
       recordsBlock += `\nLast ${context.recentTransactions.length} transactions (newest first):\n`;
       context.recentTransactions.forEach((t) => {
-        const date = (t.transaction_date || t.created_at || '').toString().split('T')[0];
+        const date = lagosTime(t.transaction_date || t.created_at).format('YYYY-MM-DD');
         const parts = [date, t.type, t.party_name, t.item_description, formatNaira(t.total_amount || 0)];
         if (t.amount_paid) parts.push(`paid ${formatNaira(t.amount_paid)}`);
         if (t.balance_remaining) parts.push(`balance ${formatNaira(t.balance_remaining)}`);
