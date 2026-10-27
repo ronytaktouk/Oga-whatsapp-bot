@@ -108,8 +108,13 @@ function createDashboardLink(traderId) {
 
 /** Words that mean "send me my dashboard" */
 function isDashboardRequest(message) {
-  const m = (message || '').trim().toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
-  return ['dashboard', 'my dashboard', 'records', 'my records', 'my book', 'book', 'open book', 'open my book', 'link'].includes(m);
+  const m = (message || '').toLowerCase().replace(/[^a-z ]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!m) return false;
+  const words = m.split(' ');
+  // Short messages that mention the dashboard: "dashboard", "send me my dashboard link", "open dashboard abeg"
+  if (words.length <= 12 && /\b(dashboard|dash board|dashbord|dashbaord)\b/.test(m)) return true;
+  // Very short requests for the book or the link
+  return ['records', 'my records', 'my book', 'book', 'open book', 'open my book', 'link', 'my link', 'send link', 'send my link'].includes(m);
 }
 
 // ============================================
