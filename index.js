@@ -92,6 +92,7 @@ function sanitizeTransaction(tx, fallbackDate) {
     balance,
     party: cleanParty(tx.party),
     item: tx.item && String(tx.item).toLowerCase() !== 'null' ? tx.item : null,
+    project: cleanParty(tx.project) ? cleanParty(tx.project).slice(0, 60) : null,
     transaction_date: date,
   };
 }
@@ -281,6 +282,9 @@ const SYSTEM_PROMPT = require('./system-prompt');
 // Import cron jobs
 const { initializeCrons } = require('./crons');
 
+// Import the web dashboard (private page opened from a WhatsApp link)
+const { setupDashboard, createDashboardLink, isDashboardRequest, projectTotals } = require('./dashboard');
+
 // ============================================
 // INITIALIZE EXPRESS APP
 // ============================================
@@ -376,9 +380,7 @@ async function createTrader(phone) {
  * Save transaction to database
  */
 async function saveTransaction(traderId, txData) {
-  const { data, error } = await supabase
-    .from('transactions')
-    .insert({
+  const row = {
       trader_id: traderId,
       type: txData.type,
       total_amount: txData.amount,
@@ -390,9 +392,17 @@ async function saveTransaction(traderId, txData) {
       business_type: txData.business_type || 'general',
       notes: txData.notes || '',
       transaction_date: txData.transaction_date || new Date()
-    })
-    .select()
-    .single();
+  };
+  if (txData.project) row.project = txData.project;
+
+  let { data, error } = await supabase.from('transactions').insert(row).select().single();
+
+  // The "project" column has not been added in Supabase yet: save without it
+  if (error && row.project && /project/i.test(error.message || '')) {
+    console.error('⚠️ Projects need one setup step in Supabase (see the SQL in the setup note). Saving without the project for now.');
+    delete row.project;
+    ({ data, error } = await supabase.from('transactions').insert(row).select().single());
+  }
 
   if (error) {
     console.error('❌ Transaction save error:', error);
@@ -531,6 +541,15 @@ async function loadTraderContext(traderId, userMessage = '') {
     .not('party_name', 'is', null);
   if (partyError) console.error('❌ Error loading balances:', partyError);
 
+  // Project totals (optional: only traders who tag projects have any)
+  const { data: projectTx, error: projectError } = await supabase
+    .from('transactions')
+    .select('project, type, total_amount, amount_paid')
+    .eq('trader_id', traderId)
+    .not('project', 'is', null);
+  if (projectError && !/project/i.test(projectError.message || '')) console.error('❌ Error loading projects:', projectError);
+  const projects = projectTotals(projectError ? [] : projectTx || []).slice(0, 15);
+
   // Get conversation history (6 = 3 full exchanges)
   const { data: history, error: historyError } = await supabase
     .from('conversation_history')
@@ -589,6 +608,7 @@ async function loadTraderContext(traderId, userMessage = '') {
     todayExpenses,
     recentTransactions: transactions?.slice(0, 10) || [],
     outstandingBalances,
+    projects,
     conversationHistory: history || [],
     summaryData
   };
@@ -701,6 +721,13 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
       recordsBlock += `\nOutstanding balances: none\n`;
     }
 
+    if (context.projects.length > 0) {
+      recordsBlock += `\nProjects (all time):\n`;
+      context.projects.forEach((p) => {
+        recordsBlock += `- ${p.name}: received ${formatNaira(p.received)}, spent ${formatNaira(p.spent)}, difference ${p.difference < 0 ? '-' : ''}${formatNaira(Math.abs(p.difference))}\n`;
+      });
+    }
+
     if (context.recentTransactions.length > 0) {
       recordsBlock += `\nLast ${context.recentTransactions.length} transactions (newest first):\n`;
       context.recentTransactions.forEach((t) => {
@@ -708,6 +735,7 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
         const parts = [date, t.type, t.party_name, t.item_description, formatNaira(t.total_amount || 0)];
         if (t.amount_paid) parts.push(`paid ${formatNaira(t.amount_paid)}`);
         if (t.balance_remaining) parts.push(`balance ${formatNaira(t.balance_remaining)}`);
+        if (t.project) parts.push(`project ${t.project}`);
         recordsBlock += `- ${parts.filter(Boolean).join(' | ')}\n`;
       });
     } else {
@@ -749,9 +777,14 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
     // Caching is NOT automatic: cache_control marks the fixed system prompt
     // for caching, so repeat messages pay much less for it.
     console.log(`🤖 Calling Claude (${CLAUDE_MODEL}) for ${trader.name}...`);
+    // Haiku 5.5 "thinks" before answering, and that thinking uses up max_tokens.
+    // effort "low" keeps thinking short (it often skips it on simple messages),
+    // and 4096 leaves room so the reply and [TRANSACTION] blocks are never cut off.
+    // You only pay for tokens actually used, not the limit.
     const response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 1024,
+      max_tokens: 4096,
+      output_config: { effort: process.env.OGA_EFFORT || 'low' },
       system: [
         {
           type: 'text',
@@ -774,11 +807,17 @@ async function handleMessage(from, trader, message, messageTimestamp = new Date(
       const types = (response.content || []).map((b) => b.type).join(', ') || 'none';
       throw new Error(`Claude returned no text (stop_reason: ${response.stop_reason}, blocks: ${types})`);
     }
-    console.log(`✅ Claude responded (${fullText.length} chars, stop_reason: ${response.stop_reason})`);
+    const outTokens = response.usage?.output_tokens ?? '?';
+    console.log(`✅ Claude responded (${fullText.length} chars, ${outTokens} output tokens, stop_reason: ${response.stop_reason})`);
+    if (response.stop_reason === 'max_tokens') {
+      console.error('⚠️ Reply was cut off by max_tokens; any unfinished transaction was not saved');
+    }
 
-    // Remove all [TRANSACTION] blocks from what the trader sees
+    // Remove all [TRANSACTION] blocks from what the trader sees,
+    // including a half-written one at the end if the reply was cut off
     const responseText = fullText
       .replace(/\[TRANSACTION\][\s\S]*?\[\/TRANSACTION\]/g, '')
+      .replace(/\[TRANSACTION\][\s\S]*$/, '')
       .trim();
 
     // From here on, records may be saved. If anything fails after this point,
@@ -958,6 +997,15 @@ app.post('/webhook', async (req, res) => {
       return res.status(200).send('OK');
     }
 
+    // 5. "dashboard" → send the trader a private link to their book (no AI call needed)
+    if (isDashboardRequest(message)) {
+      await sendMessage(
+        from,
+        `📒 Here is your OGA book:\n${createDashboardLink(trader.id)}\n\nThe link works for 30 minutes. You go need your 4-digit PIN. No share am with anybody.`
+      );
+      return res.status(200).send('OK');
+    }
+
     // Respond immediately to Twilio FIRST (prevents timeout)
     res.status(200).send('OK');
 
@@ -980,6 +1028,12 @@ app.post('/webhook', async (req, res) => {
     res.status(500).send('Error');
   }
 });
+
+// ============================================
+// WEB DASHBOARD
+// ============================================
+
+setupDashboard(app, supabase);
 
 // ============================================
 // HEALTH CHECK ENDPOINT
